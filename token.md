@@ -1,22 +1,22 @@
-🚀 Token-Guard: The Smart Context-Aware Token Compactor
+🚀 TokenTamer: The Smart Context-Aware Token Compactor
 
 💡 The Core Problem
 
 LLM coding agents (like Claude Code, Aider, and Cursor) are incredibly expensive to run on large codebases. When an agent needs to understand a project, it pulls in massive files—burning tens of thousands of tokens. Often, 90% of that code (deep inner logic, loops, docstrings) is irrelevant to the specific bug being fixed. This bloats the context window, triggers API rate limits, and costs developers thousands of dollars.
 
-🛠 The Solution: Token-Guard
+🛠 The Solution: TokenTamer
 
-Token-Guard is an intelligent, drop-in middleware proxy that sits between any AI coding agent and the LLM API (OpenAI or Anthropic).
+TokenTamer is an intelligent, drop-in middleware proxy that sits between any AI coding agent and the LLM API (OpenAI or Anthropic).
 
 It intercepts the raw payload, dynamically parses the Abstract Syntax Tree (AST) of the codebase, and compresses "background" files into structural "skeletons" (just class and function signatures). It feeds the LLM only the deep logic it actually needs, triggering prompt caching and slashing costs by up to 90%.
 
 🏗 System Architecture
 
-Token-Guard operates entirely locally, functioning as an API interceptor. It does not require any changes to the underlying coding agent.
+TokenTamer operates entirely locally, functioning as an API interceptor. It does not require any changes to the underlying coding agent.
 
 graph TD
     subgraph Local Machine
-        A[Coding Agent\n(Aider, Cursor, Claude Code)] -->|1. Sends raw 100k Token payload| B(Token-Guard Proxy\nFastAPI / Go)
+        A[Coding Agent\n(Aider, Cursor, Claude Code)] -->|1. Sends raw 100k Token payload| B(TokenTamer Proxy\nFastAPI / Go)
         B -->|2. Identifies Code Blocks| C{Context Analyzer}
         
         C -->|Active File (Mentioned in Prompt)| D[Leave 100% Intact]
@@ -37,11 +37,11 @@ graph TD
 
 1. The Interceptor (API Proxy)
 
-The user changes their API Base URL in their agent to point to localhost:8000. Token-Guard catches the POST /v1/chat/completions or Anthropic /v1/messages request.
+The user changes their API Base URL in their agent to point to localhost:8000. TokenTamer catches the POST /v1/chat/completions or Anthropic /v1/messages request.
 
 2. The "Active File" Rule (Crucial for preventing AI breakage)
 
-If you blindly compress everything, the AI can't fix bugs because it can't see the inner logic. Token-Guard is smart:
+If you blindly compress everything, the AI can't fix bugs because it can't see the inner logic. TokenTamer is smart:
 
 It scans the final user prompt (e.g., "Fix the math error in payment.py").
 
@@ -74,13 +74,13 @@ The LLM still knows calculate_tax exists and how to call it, but doesn't waste t
 
 4. Forcing Prompt Caching
 
-By keeping the structural skeletons highly deterministic (removing whitespace, standardizing format) and placing them at the start of the prompt, Token-Guard forces Anthropic's Prompt Caching to trigger. This drops the cost of reading the project architecture by another 80%.
+By keeping the structural skeletons highly deterministic (removing whitespace, standardizing format) and placing them at the start of the prompt, TokenTamer forces Anthropic's Prompt Caching to trigger. This drops the cost of reading the project architecture by another 80%.
 
 5. The Terminal Flex (TUI)
 
-While the agent runs, Token-Guard displays a rich terminal dashboard showing real-time metrics. Developers love transparency.
+While the agent runs, TokenTamer displays a rich terminal dashboard showing real-time metrics. Developers love transparency.
 
-╭────────────────────── 🚀 Token-Guard Active ──────────────────────╮
+╭────────────────────── 🚀 TokenTamer Active ──────────────────────╮
 │ 🟢 File: payment.py (Intact)                                      │
 │ 🟡 File: database.py (Skeletonized - saved 4,200 tokens)          │
 │ 💰 Session Savings: $2.45 | Context Reduction: 82.4%              │

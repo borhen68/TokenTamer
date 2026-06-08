@@ -1,5 +1,5 @@
 """
-Configuration loader for Token-Guard.
+Configuration loader for TokenTamer.
 
 Loads settings from config.yaml, merging with environment variable overrides.
 Priority: environment variables > config file values.
@@ -40,6 +40,11 @@ class SkeletonizerConfig:
 
 
 @dataclass
+class ContextConfig:
+    repo_path: str = ""
+
+
+@dataclass
 class ModelPricing:
     """Pricing per 1M tokens."""
     input: float = 3.00
@@ -52,7 +57,15 @@ class Config:
     upstream: UpstreamConfig = field(default_factory=UpstreamConfig)
     api_keys: ApiKeysConfig = field(default_factory=ApiKeysConfig)
     skeletonizer: SkeletonizerConfig = field(default_factory=SkeletonizerConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
     pricing: Dict[str, ModelPricing] = field(default_factory=dict)
+
+    @property
+    def repo_path(self) -> Optional[str]:
+        path = self.context.repo_path
+        if path and Path(path).exists():
+            return str(Path(path).resolve())
+        return None
 
     def get_api_key(self, provider: str, request_key: Optional[str] = None) -> str:
         """
@@ -91,7 +104,7 @@ def load_config(config_path: Union[str, Path, None] = None) -> Config:
         for candidate in [
             Path("config.yaml"),
             Path("token_guard.yaml"),
-            Path.home() / ".config" / "token-guard" / "config.yaml",
+            Path.home() / ".config" / "token-tamer" / "config.yaml",
         ]:
             if candidate.exists():
                 with open(candidate, "r") as f:
@@ -125,6 +138,12 @@ def load_config(config_path: Union[str, Path, None] = None) -> Config:
         config.api_keys = ApiKeysConfig(
             openai=os.environ.get("OPENAI_API_KEY", ""),
             anthropic=os.environ.get("ANTHROPIC_API_KEY", ""),
+        )
+
+    # Context settings
+    if "context" in raw:
+        config.context = ContextConfig(
+            repo_path=raw["context"].get("repo_path", ""),
         )
 
     # Skeletonizer settings

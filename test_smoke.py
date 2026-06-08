@@ -1,8 +1,8 @@
-"""Smoke test for Token-Guard core components."""
+"""Smoke test for TokenTamer core components."""
 
-from token_guard.skeletonizer import Skeletonizer
-from token_guard.context_analyzer import ContextAnalyzer
-from token_guard.token_counter import TokenCounter
+from token_tamer.skeletonizer import Skeletonizer
+from token_tamer.context_analyzer import ContextAnalyzer
+from token_tamer.token_counter import TokenCounter
 
 # ── Test 1: Skeletonizer ──
 print("=" * 60)

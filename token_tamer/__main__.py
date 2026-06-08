@@ -1,20 +1,22 @@
 """
-Token-Guard CLI entry point.
+TokenTamer CLI entry point.
 
 Usage:
-    python -m token_guard [--port PORT] [--host HOST] [--config PATH]
-    token-guard [--port PORT] [--host HOST] [--config PATH]
+    python -m token_tamer [--port PORT] [--host HOST] [--config PATH]
+    token-tamer [--port PORT] [--host HOST] [--config PATH]
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import signal
 import sys
 
 import uvicorn
 
 from . import __version__, __app_name__
+from .cert_manager import CertManager
 from .config import load_config
 from .dashboard import Dashboard
 from .server import create_app
@@ -23,8 +25,8 @@ from .token_counter import SessionMetrics
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="token-guard",
-        description="🚀 Token-Guard: Smart context-aware token compactor for LLM coding agents",
+        prog="token-tamer",
+        description="🚀 TokenTamer: Drop-in proxy that compresses bloated code context, cutting LLM API costs by 50–80%.",
     )
     parser.add_argument(
         "--port", "-p",
@@ -50,6 +52,14 @@ def parse_args() -> argparse.Namespace:
         help="Disable the terminal dashboard",
     )
     parser.add_argument(
+        "--ssl",
+        action="store_true",
+        help=(
+            "Enable HTTPS interception mode for Claude Code / Codex CLI. "
+            "Requires trusting the CA and editing /etc/hosts."
+        ),
+    )
+    parser.add_argument(
         "--version", "-v",
         action="version",
         version=f"{__app_name__} {__version__}",
@@ -58,8 +68,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Main entry point for Token-Guard."""
+    """Main entry point for TokenTamer."""
     args = parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
 
     # Load configuration
     config = load_config(args.config)
@@ -67,6 +82,21 @@ def main() -> None:
     # CLI args override config file
     host = args.host or config.proxy.host
     port = args.port or config.proxy.port
+
+    ssl_certfile: str | None = None
+    ssl_keyfile: str | None = None
+
+    if args.ssl:
+        cert_mgr = CertManager()
+        cert, key = cert_mgr.ensure_server_cert()
+        ssl_certfile = str(cert)
+        ssl_keyfile = str(key)
+        cert_mgr.print_instructions()
+
+        # Suggest privileged port if not already set
+        if port == 8000:
+            print("💡 Hint: Use --port 443 for full interception (requires sudo)")
+            print("   or --port 8443 and configure clients manually.\n")
 
     # Create shared metrics
     metrics = SessionMetrics()
@@ -77,7 +107,7 @@ def main() -> None:
         dashboard = Dashboard(metrics, host=host, port=port)
 
     # Create the FastAPI app
-    app = create_app(config, metrics, dashboard)
+    app = create_app(config, metrics, dashboard, ssl_mode=args.ssl)
 
     # Print startup banner
     if dashboard:
@@ -97,13 +127,18 @@ def main() -> None:
         dashboard.start()
 
     # Run the server
-    uvicorn.run(
-        app,
+    uvicorn_kwargs = dict(
+        app=app,
         host=host,
         port=port,
-        log_level="warning",  # Keep logs minimal — dashboard shows what matters
+        log_level="warning",
         access_log=False,
     )
+    if ssl_certfile and ssl_keyfile:
+        uvicorn_kwargs["ssl_certfile"] = ssl_certfile
+        uvicorn_kwargs["ssl_keyfile"] = ssl_keyfile
+
+    uvicorn.run(**uvicorn_kwargs)
 
 
 if __name__ == "__main__":

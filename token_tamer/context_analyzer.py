@@ -1,5 +1,5 @@
 """
-Context analyzer for Token-Guard.
+Context analyzer for TokenTamer.
 
 Scans the message payload to determine which code blocks are "active"
 (mentioned in the user's prompt and should be left intact) vs "background"
@@ -53,16 +53,18 @@ FILE_REFERENCE_PATTERNS = [
 ]
 
 # Regex to find fenced code blocks with optional file annotations
+# Supports # File: (Python/Ruby/Shell), // File: (JS/TS/Go/C), /* File: */ (C/JS block)
 CODE_BLOCK_PATTERN = re.compile(
-    r'(?:(?:#\s*(?:File|file|MODULE|module):\s*(\S+)\n)|'  # Comment annotation above
-    r'(?:<!--\s*file:\s*(\S+)\s*-->\n))?'                   # HTML annotation above
+    r'(?:(?:#|//)\s*(?:File|file|MODULE|module):\s*(\S+)\n|'
+    r'(?:/\*\s*(?:File|file|MODULE|module):\s*(\S+)\s*\*/\n|'
+    r'<!--\s*file:\s*(\S+)\s*-->\n))?'                   # HTML annotation above
     r'```(\w*)\n(.*?)```',                                   # The fenced code block
     re.DOTALL,
 )
 
 # Pattern for inline file annotations within code blocks
 INLINE_FILE_ANNOTATION = re.compile(
-    r'^#\s*(?:File|file|MODULE|module):\s*(\S+)',
+    r'^(?:#|//)\s*(?:File|file|MODULE|module):\s*(\S+)',
     re.MULTILINE,
 )
 
@@ -93,15 +95,29 @@ class ContextAnalyzer:
     """
     Analyzes LLM message payloads to identify active vs background code blocks,
     then selectively compresses background blocks using the Skeletonizer.
+
+    Optionally uses a SemanticEngine for intent-based active-file detection
+    when a repo_path is provided.
     """
 
-    def __init__(self, skeletonizer: Skeletonizer):
+    def __init__(self, skeletonizer: Skeletonizer, repo_path: Optional[str] = None):
         self.skeletonizer = skeletonizer
+        self._repo_path = repo_path
+        self._semantic_engine: Optional[object] = None
+        if repo_path:
+            try:
+                from token_tamer_core.semantic_engine import SemanticEngine
+                self._semantic_engine = SemanticEngine()
+            except ImportError:
+                pass
 
     def extract_active_files(self, messages: List[dict]) -> Set[str]:
         """
         Scan messages (especially the last user message) to find file references
         that indicate which files the user is actively working on.
+
+        If a repo_path was provided and sentence-transformers is available,
+        also boost files that are semantically similar to the user's query.
         """
         active_files: Set[str] = set()
 
@@ -111,31 +127,53 @@ class ContextAnalyzer:
             if m.get("role") == "user"
         ]
 
-        # Also check system messages for explicit active file markers
+        last_user_text = ""
+        # Process user and system messages for explicit file references
         for msg in messages:
             content = self._get_text_content(msg)
             if not content:
                 continue
-                
+
             # Strip out code blocks so we only look at natural language text.
-            # This prevents files mentioned inside code block annotations 
-            # from being incorrectly marked as "active".
             text_only = CODE_BLOCK_PATTERN.sub("", content)
 
             role = msg.get("role", "")
+            is_user = role == "user"
+            is_system = role == "system"
+            is_last_user = bool(
+                user_messages and len(messages) > 0
+                and msg == user_messages[-1]
+            )
 
-            if role == "user" or msg == (user_messages[-1] if user_messages else None):
-                # Extract all file references from user messages
+            if is_user or is_system or is_last_user:
+                if is_last_user:
+                    last_user_text = text_only
                 for pattern in FILE_REFERENCE_PATTERNS:
                     for match in pattern.finditer(text_only):
                         filename = match.group(1)
                         if filename:
                             active_files.add(self._normalize_filename(filename))
 
+        # Semantic boost: if we have a repo and a user query, add highly
+        # semantically relevant files to the active set.
+        if self._semantic_engine and self._repo_path and last_user_text:
+            try:
+                scores = self._semantic_engine.get_semantic_scores(
+                    self._repo_path, last_user_text
+                )
+                # Boost files with similarity >= 0.5 into active set
+                for filepath, score in scores.items():
+                    if score >= 0.5:
+                        active_files.add(self._normalize_filename(filepath))
+            except Exception:
+                pass
+
         return active_files
 
     def analyze_and_compress(
-        self, messages: List[dict]
+        self,
+        messages: List[dict],
+        all_messages: Optional[List[dict]] = None,
     ) -> Tuple[List[dict], AnalysisResult]:
         """
         Analyze the messages array, identify code blocks, and compress
@@ -143,31 +181,31 @@ class ContextAnalyzer:
 
         Args:
             messages: The messages array from the API request payload.
+            all_messages: Optional extended messages (e.g. including system prompt)
+                           for active-file detection only.
 
         Returns:
             Tuple of (modified messages, analysis result).
         """
-        active_files = self.extract_active_files(messages)
+        active_files = self.extract_active_files(all_messages or messages)
         result = AnalysisResult(active_files=active_files)
         modified_messages = []
 
         for msg in messages:
-            content = self._get_text_content(msg)
-            if not content:
+            raw_content = msg.get("content", "")
+            if not raw_content:
                 modified_messages.append(msg.copy())
                 continue
 
-            # Process code blocks in this message
-            modified_content = self._process_content(content, active_files, result)
-
             # Create modified message
             new_msg = msg.copy()
-            if isinstance(msg.get("content"), str):
+            if isinstance(raw_content, str):
+                modified_content = self._process_content(raw_content, active_files, result)
                 new_msg["content"] = modified_content
-            elif isinstance(msg.get("content"), list):
-                # Multi-part content: modify text parts
+            elif isinstance(raw_content, list):
+                # Multi-part content: modify each text part individually
                 new_parts = []
-                for part in msg["content"]:
+                for part in raw_content:
                     if isinstance(part, dict) and part.get("type") == "text":
                         new_part = part.copy()
                         new_part["text"] = self._process_content(
@@ -192,10 +230,10 @@ class ContextAnalyzer:
         offset = 0  # Track position offset from replacements
 
         for match in CODE_BLOCK_PATTERN.finditer(content):
-            # Extract file annotation (from comment above, HTML comment, or inline)
-            filename = match.group(1) or match.group(2)
-            language = match.group(3) or ""
-            code_content = match.group(4)
+            # Extract file annotation (#|//, /* */, or <!-- -->)
+            filename = match.group(1) or match.group(2) or match.group(3)
+            language = match.group(4) or ""
+            code_content = match.group(5)
 
             # Check for inline file annotation within the code block
             if not filename:
@@ -230,11 +268,10 @@ class ContextAnalyzer:
 
             result.total_blocks += 1
 
-            if not is_active and language.lower() in ("python", "py", ""):
+            if not is_active:
                 # Try to skeletonize this background block
-                lang = "python" if language.lower() in ("python", "py") else language
                 skeleton_result = self.skeletonizer.skeletonize(
-                    code_content, language=lang
+                    code_content, language=language
                 )
 
                 if skeleton_result.was_compressed:

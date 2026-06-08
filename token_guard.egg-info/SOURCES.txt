@@ -1,5 +1,8 @@
 README.md
 pyproject.toml
+tests/test_context_analyzer.py
+tests/test_server.py
+tests/test_skeletonizer.py
 token_guard/__init__.py
 token_guard/__main__.py
 token_guard/config.py
@@ -14,3 +17,8 @@ token_guard.egg-info/dependency_links.txt
 token_guard.egg-info/entry_points.txt
 token_guard.egg-info/requires.txt
 token_guard.egg-info/top_level.txt
+token_guard_core/__init__.py
+token_guard_core/assembler.py
+token_guard_core/dependency_engine.py
+token_guard_core/git_engine.py
+token_guard_core/semantic_engine.py

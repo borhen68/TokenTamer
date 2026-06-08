@@ -147,6 +147,9 @@ upstream:
   openai_url: "https://api.openai.com"
   anthropic_url: "https://api.anthropic.com"
 
+context:
+  repo_path: "/path/to/your/codebase"  # Enables semantic active-file detection
+
 skeletonizer:
   keep_docstrings: false      # Preserve function docstrings?
   keep_class_attrs: true      # Keep class-level attributes?
@@ -160,6 +163,29 @@ pricing:                       # Per 1M tokens for cost estimation
     output: 15.00
 ```
 
+## 🌐 Multi-Language Support
+
+Token-Guard skeletonizes more than just Python:
+
+| Language   | Method      | Status |
+|------------|------------|--------|
+| Python     | Native AST | ✅     |
+| JavaScript | Brace-balance heuristic | ✅ |
+| TypeScript | Brace-balance heuristic | ✅ |
+| Go         | Brace-balance heuristic | ✅ |
+| Rust       | Brace-balance heuristic | ✅ |
+| Java / C# / C / C++ | Brace-balance heuristic | ✅ |
+
+## 🧠 Semantic Active-File Detection
+
+If you provide a `repo_path` in `config.yaml` and install `sentence-transformers`,
+Token-Guard uses embeddings to detect which files are semantically relevant to your
+query — even if you don't mention them by name.
+
+```bash
+pip install sentence-transformers scikit-learn
+```
+
 ## 🛠 Supported APIs
 
 | Provider  | Endpoint                  | Status |
@@ -168,6 +194,13 @@ pricing:                       # Per 1M tokens for cost estimation
 | OpenAI    | `/v1/completions`        | ✅ (pass-through) |
 | OpenAI    | `/v1/models`             | ✅ (pass-through) |
 | Anthropic | `/v1/messages`           | ✅     |
+
+## 🧪 Testing
+
+```bash
+pip install -e ".[dev]"
+pytest tests/ -v
+```
 
 ## 📋 Requirements
 

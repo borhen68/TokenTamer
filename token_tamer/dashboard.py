@@ -1,5 +1,5 @@
 """
-Rich terminal dashboard for Token-Guard.
+Rich terminal dashboard for TokenTamer.
 
 Displays a beautiful real-time terminal UI showing proxy status,
 per-file compression results, and cumulative session savings.
@@ -58,7 +58,7 @@ def _compression_bar(ratio: float, width: int = 20) -> Text:
 
 class Dashboard:
     """
-    Real-time terminal dashboard for Token-Guard metrics.
+    Real-time terminal dashboard for TokenTamer metrics.
 
     Runs a Rich Live display in a background thread, updating
     every second with the latest proxy metrics.
@@ -184,7 +184,7 @@ class Dashboard:
         # ── Build the outer panel ──
         display = Panel(
             Group(*sections),
-            title="[bold bright_white]🚀 Token-Guard Active[/bold bright_white]",
+            title="[bold bright_white]🚀 TokenTamer Active[/bold bright_white]",
             subtitle="[dim]Ctrl+C to stop[/dim]",
             border_style="bright_cyan",
             padding=(1, 2),
@@ -198,7 +198,7 @@ class Dashboard:
         self._console.print()
         banner = Panel(
             Group(
-                Text("🚀 Token-Guard v0.1.0", style="bold bright_cyan", justify="center"),
+                Text("🚀 TokenTamer v0.1.0", style="bold bright_cyan", justify="center"),
                 Text("Smart Context-Aware Token Compactor", style="dim italic", justify="center"),
                 Text("", justify="center"),
                 Text(

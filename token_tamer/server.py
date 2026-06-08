@@ -1,5 +1,5 @@
 """
-FastAPI proxy server for Token-Guard.
+FastAPI proxy server for TokenTamer.
 
 Intercepts LLM API requests (OpenAI and Anthropic format), compresses
 background code blocks via AST skeletonization, and forwards the optimized
@@ -9,12 +9,16 @@ payload to the upstream provider. Responses are streamed back transparently.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import AsyncGenerator, List, Optional
 
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+
+logger = logging.getLogger("token_guard")
 
 from .config import Config
 from .context_analyzer import ContextAnalyzer
@@ -26,12 +30,14 @@ from .token_counter import (
     SessionMetrics,
     TokenCounter,
 )
+from . import upstream_resolver
 
 
 def create_app(
     config: Config,
     metrics: SessionMetrics,
     dashboard: Optional[Dashboard] = None,
+    ssl_mode: bool = False,
 ) -> FastAPI:
     """
     Create and configure the FastAPI application.
@@ -45,7 +51,7 @@ def create_app(
         Configured FastAPI app.
     """
     app = FastAPI(
-        title="Token-Guard Proxy",
+        title="TokenTamer Proxy",
         description="Smart context-aware token compactor for LLM coding agents",
         version="0.1.0",
         docs_url=None,  # Disable docs in production proxy
@@ -57,7 +63,7 @@ def create_app(
         keep_docstrings=config.skeletonizer.keep_docstrings,
         keep_class_attrs=config.skeletonizer.keep_class_attrs,
     )
-    analyzer = ContextAnalyzer(skeletonizer)
+    analyzer = ContextAnalyzer(skeletonizer, repo_path=config.repo_path)
     counter = TokenCounter()
 
     # Shared HTTP client (connection pooling)
@@ -66,6 +72,13 @@ def create_app(
         follow_redirects=True,
         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
     )
+
+    # In SSL interception mode, /etc/hosts points upstream domains to localhost.
+    # We must bypass that mapping so httpx reaches the real APIs.
+    if ssl_mode:
+        import socket
+        socket.getaddrinfo = upstream_resolver._patched_getaddrinfo
+        logger.info("SSL interception mode: socket.getaddrinfo patched for upstream DNS bypass")
 
     @app.on_event("shutdown")
     async def shutdown():
@@ -107,24 +120,21 @@ def create_app(
         is_streaming = body.get("stream", False)
 
         # ── Compress ──
-        request_metrics = _compress_messages(
-            messages, model, analyzer, counter, config
-        )
-        body["messages"] = messages  # messages are modified in-place by reference
-        # Actually, analyze_and_compress returns new messages
-        compressed_messages, analysis = analyzer.analyze_and_compress(messages)
-        body["messages"] = compressed_messages
+        try:
+            compressed_messages, analysis = analyzer.analyze_and_compress(messages)
+            body["messages"] = compressed_messages
+        except Exception as e:
+            logger.warning(f"Compression failed: {e}. Forwarding original payload.")
+            compressed_messages = messages
+            analysis = None
 
         # ── Count tokens and record metrics ──
         original_tokens = counter.count_messages(messages, model)
         compressed_tokens = counter.count_messages(compressed_messages, model)
 
-        req_metrics = RequestMetrics(
-            timestamp=time.time(),
-            original_tokens=original_tokens,
-            compressed_tokens=compressed_tokens,
-            model=model,
-            file_stats=[
+        file_stats = []
+        if analysis:
+            file_stats = [
                 FileStats(
                     filename=block.filename or "unknown",
                     original_tokens=counter.count(block.content, model),
@@ -135,7 +145,14 @@ def create_app(
                     was_skeletonized=block.skeleton_result is not None and block.skeleton_result.was_compressed,
                 )
                 for block in analysis.code_blocks
-            ],
+            ]
+
+        req_metrics = RequestMetrics(
+            timestamp=time.time(),
+            original_tokens=original_tokens,
+            compressed_tokens=compressed_tokens,
+            model=model,
+            file_stats=file_stats,
         )
 
         # Estimate cost savings
@@ -160,7 +177,7 @@ def create_app(
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
-                    "X-Token-Guard-Saved": str(req_metrics.tokens_saved),
+                    "X-TokenTamer-Saved": str(req_metrics.tokens_saved),
                 },
             )
         else:
@@ -174,7 +191,7 @@ def create_app(
                 status_code=response.status_code,
                 headers={
                     "Content-Type": response.headers.get("content-type", "application/json"),
-                    "X-Token-Guard-Saved": str(req_metrics.tokens_saved),
+                    "X-TokenTamer-Saved": str(req_metrics.tokens_saved),
                 },
             )
 
@@ -257,19 +274,23 @@ def create_app(
                 all_messages.insert(0, {"role": "system", "content": text_parts})
 
         # ── Compress ──
-        compressed_messages, analysis = analyzer.analyze_and_compress(messages)
-        body["messages"] = compressed_messages
+        try:
+            compressed_messages, analysis = analyzer.analyze_and_compress(
+                messages, all_messages=all_messages
+            )
+            body["messages"] = compressed_messages
+        except Exception as e:
+            logger.warning(f"Compression failed: {e}. Forwarding original payload.")
+            compressed_messages = messages
+            analysis = None
 
         # ── Count tokens and record metrics ──
         original_tokens = counter.count_messages(messages, model)
         compressed_tokens = counter.count_messages(compressed_messages, model)
 
-        req_metrics = RequestMetrics(
-            timestamp=time.time(),
-            original_tokens=original_tokens,
-            compressed_tokens=compressed_tokens,
-            model=model,
-            file_stats=[
+        file_stats = []
+        if analysis:
+            file_stats = [
                 FileStats(
                     filename=block.filename or "unknown",
                     original_tokens=counter.count(block.content, model),
@@ -280,7 +301,14 @@ def create_app(
                     was_skeletonized=block.skeleton_result is not None and block.skeleton_result.was_compressed,
                 )
                 for block in analysis.code_blocks
-            ],
+            ]
+
+        req_metrics = RequestMetrics(
+            timestamp=time.time(),
+            original_tokens=original_tokens,
+            compressed_tokens=compressed_tokens,
+            model=model,
+            file_stats=file_stats,
         )
 
         pricing = config.get_pricing(model)
@@ -310,7 +338,7 @@ def create_app(
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
-                    "X-Token-Guard-Saved": str(req_metrics.tokens_saved),
+                    "X-TokenTamer-Saved": str(req_metrics.tokens_saved),
                 },
             )
         else:
@@ -324,7 +352,7 @@ def create_app(
                 status_code=response.status_code,
                 headers={
                     "Content-Type": response.headers.get("content-type", "application/json"),
-                    "X-Token-Guard-Saved": str(req_metrics.tokens_saved),
+                    "X-TokenTamer-Saved": str(req_metrics.tokens_saved),
                 },
             )
 

@@ -3,14 +3,14 @@ requires = ["setuptools>=65.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "token-guard"
+name = "token-tamer"
 version = "0.1.0"
-description = "🚀 Smart context-aware token compactor for LLM coding agents"
+description = "A drop-in proxy that compresses bloated code context in real-time, cutting LLM API costs by 50–80%."
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
-    {name = "Token-Guard Contributors"}
+    {name = "Borhen Eddine Saidi"}
 ]
 keywords = ["llm", "tokens", "proxy", "ast", "openai", "anthropic", "coding-agent"]
 classifiers = [
@@ -41,7 +41,7 @@ dev = [
 ]
 
 [project.scripts]
-token-guard = "token_guard.__main__:main"
+token-tamer = "token_tamer.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["token_guard*"]
+include = ["token_tamer*"]

@@ -1,8 +1,12 @@
-# 🚀 Token-Guard
+# 🚀 TokenTamer
 
-**Smart Context-Aware Token Compactor for LLM Coding Agents**
+[![CI](https://github.com/borhen68/TokenTamer/actions/workflows/ci.yml/badge.svg)](https://github.com/borhen68/TokenTamer/actions)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Token-Guard is an intelligent, drop-in middleware proxy that sits between any AI coding agent (Aider, Cursor, Claude Code) and the LLM API. It intercepts raw payloads, dynamically parses the AST of code files, and compresses "background" files into structural skeletons — slashing token costs by up to 90%.
+**A drop-in proxy that compresses bloated code context in real-time, cutting LLM API costs by 50–80% without losing what the model actually needs to know.**
+
+TokenTamer is an intelligent, drop-in middleware proxy that sits between any AI coding agent (Aider, Cursor, Claude Code, Codex) and the LLM API. It intercepts raw payloads, dynamically parses the AST of code files, and compresses "background" files into structural skeletons — slashing token costs by up to 90%.
 
 ## ✨ Features
 
@@ -19,8 +23,8 @@ Token-Guard is an intelligent, drop-in middleware proxy that sits between any AI
 
 ```bash
 # Clone the repository
-git clone <repo-url>
-cd token-guard
+git clone https://github.com/borhen68/TokenTamer.git
+cd TokenTamer
 
 # Install with pip
 pip install -e .
@@ -30,21 +34,21 @@ pip install -e .
 
 ```bash
 # Start the proxy (default: http://127.0.0.1:8000)
-token-guard
+token-tamer
 
 # Or with custom settings
-token-guard --port 9000 --host 0.0.0.0
+token-tamer --port 9000 --host 0.0.0.0
 
 # With a custom config file
-token-guard --config /path/to/config.yaml
+token-tamer --config /path/to/config.yaml
 
 # Without the terminal dashboard
-token-guard --no-dashboard
+token-tamer --no-dashboard
 ```
 
 ### Configure Your Agent
 
-Point your coding agent's API base URL to Token-Guard:
+Point your coding agent's API base URL to TokenTamer:
 
 **Aider:**
 ```bash
@@ -53,18 +57,36 @@ aider --openai-api-base http://127.0.0.1:8000/v1
 
 **Cursor:** Update the API base URL in Settings → Models → OpenAI API Base
 
-**Claude Code / Custom scripts:**
-```python
-import openai
-client = openai.OpenAI(
-    api_key="your-key",
-    base_url="http://127.0.0.1:8000/v1"
-)
+**Claude Code / Codex CLI (hardcoded endpoints):**
+
+These tools don't expose a base URL setting. Use **SSL interception mode**:
+
+```bash
+# 1. Generate certificates and print setup instructions
+token-tamer --ssl --port 443
+
+# 2. Trust the CA (macOS)
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain \
+  ~/.config/token-tamer/certs/ca-cert.pem
+
+# 3. Edit /etc/hosts (needs sudo)
+sudo nano /etc/hosts
+# Add these lines:
+127.0.0.1 api.openai.com
+127.0.0.1 api.anthropic.com
+
+# 4. Now Claude Code and Codex CLI traffic flows through TokenTamer
+claude "create a snake game"
+codex "refactor this module"
 ```
+
+TokenTamer intercepts the HTTPS traffic, compresses the context, and forwards
+ to the real APIs while transparently bypassing your `/etc/hosts` mapping.
 
 ### API Keys
 
-Token-Guard resolves API keys in this priority order:
+TokenTamer resolves API keys in this priority order:
 
 1. **Request headers** — Keys sent by your agent (default behavior, zero config needed)
 2. **Environment variables** — `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`
@@ -73,7 +95,7 @@ Token-Guard resolves API keys in this priority order:
 ## 📊 How It Works
 
 ```
-Your Agent                    Token-Guard                      LLM API
+Your Agent                    TokenTamer                      LLM API
     │                              │                              │
     │── 100k token payload ──────▶│                              │
     │                              │── Identify active files      │
@@ -119,6 +141,9 @@ upstream:
   openai_url: "https://api.openai.com"
   anthropic_url: "https://api.anthropic.com"
 
+context:
+  repo_path: "/path/to/your/codebase"  # Enables semantic active-file detection
+
 skeletonizer:
   keep_docstrings: false      # Preserve function docstrings?
   keep_class_attrs: true      # Keep class-level attributes?
@@ -132,6 +157,29 @@ pricing:                       # Per 1M tokens for cost estimation
     output: 15.00
 ```
 
+## 🌐 Multi-Language Support
+
+TokenTamer skeletonizes more than just Python:
+
+| Language   | Method      | Status |
+|------------|------------|--------|
+| Python     | Native AST | ✅     |
+| JavaScript | Brace-balance heuristic | ✅ |
+| TypeScript | Brace-balance heuristic | ✅ |
+| Go         | Brace-balance heuristic | ✅ |
+| Rust       | Brace-balance heuristic | ✅ |
+| Java / C# / C / C++ | Brace-balance heuristic | ✅ |
+
+## 🧠 Semantic Active-File Detection
+
+If you provide a `repo_path` in `config.yaml` and install `sentence-transformers`,
+TokenTamer uses embeddings to detect which files are semantically relevant to your
+query — even if you don't mention them by name.
+
+```bash
+pip install sentence-transformers scikit-learn
+```
+
 ## 🛠 Supported APIs
 
 | Provider  | Endpoint                  | Status |
@@ -140,6 +188,13 @@ pricing:                       # Per 1M tokens for cost estimation
 | OpenAI    | `/v1/completions`        | ✅ (pass-through) |
 | OpenAI    | `/v1/models`             | ✅ (pass-through) |
 | Anthropic | `/v1/messages`           | ✅     |
+
+## 🧪 Testing
+
+```bash
+pip install -e ".[dev]"
+pytest tests/ -v
+```
 
 ## 📋 Requirements
 
