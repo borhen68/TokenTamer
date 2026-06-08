@@ -1,0 +1,179 @@
+Metadata-Version: 2.4
+Name: token-guard
+Version: 0.1.0
+Summary: 🚀 Smart context-aware token compactor for LLM coding agents
+Author: Token-Guard Contributors
+License: MIT
+Keywords: llm,tokens,proxy,ast,openai,anthropic,coding-agent
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Software Development :: Libraries
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.104.0
+Requires-Dist: uvicorn[standard]>=0.24.0
+Requires-Dist: httpx>=0.25.0
+Requires-Dist: tiktoken>=0.5.0
+Requires-Dist: rich>=13.0.0
+Requires-Dist: pyyaml>=6.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.21; extra == "dev"
+Requires-Dist: httpx; extra == "dev"
+
+# 🚀 Token-Guard
+
+**Smart Context-Aware Token Compactor for LLM Coding Agents**
+
+Token-Guard is an intelligent, drop-in middleware proxy that sits between any AI coding agent (Aider, Cursor, Claude Code) and the LLM API. It intercepts raw payloads, dynamically parses the AST of code files, and compresses "background" files into structural skeletons — slashing token costs by up to 90%.
+
+## ✨ Features
+
+- **🔌 Drop-in proxy** — No changes needed to your coding agent. Just change the API base URL.
+- **🧠 Smart active file detection** — Automatically identifies which files you're working on and leaves them 100% intact.
+- **🌳 AST-based compression** — Strips function bodies while preserving signatures, imports, and class structures.
+- **💰 Real-time cost tracking** — Beautiful terminal dashboard showing tokens saved and money saved.
+- **🔄 Full streaming support** — Transparent SSE streaming for both OpenAI and Anthropic APIs.
+- **⚡ Zero latency overhead** — Compression happens locally in milliseconds.
+
+## 🚀 Quick Start
+
+### Installation
+
+```bash
+# Clone the repository
+git clone <repo-url>
+cd token-guard
+
+# Install with pip
+pip install -e .
+```
+
+### Usage
+
+```bash
+# Start the proxy (default: http://127.0.0.1:8000)
+token-guard
+
+# Or with custom settings
+token-guard --port 9000 --host 0.0.0.0
+
+# With a custom config file
+token-guard --config /path/to/config.yaml
+
+# Without the terminal dashboard
+token-guard --no-dashboard
+```
+
+### Configure Your Agent
+
+Point your coding agent's API base URL to Token-Guard:
+
+**Aider:**
+```bash
+aider --openai-api-base http://127.0.0.1:8000/v1
+```
+
+**Cursor:** Update the API base URL in Settings → Models → OpenAI API Base
+
+**Claude Code / Custom scripts:**
+```python
+import openai
+client = openai.OpenAI(
+    api_key="your-key",
+    base_url="http://127.0.0.1:8000/v1"
+)
+```
+
+### API Keys
+
+Token-Guard resolves API keys in this priority order:
+
+1. **Request headers** — Keys sent by your agent (default behavior, zero config needed)
+2. **Environment variables** — `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`
+3. **Config file** — `config.yaml`
+
+## 📊 How It Works
+
+```
+Your Agent                    Token-Guard                      LLM API
+    │                              │                              │
+    │── 100k token payload ──────▶│                              │
+    │                              │── Identify active files      │
+    │                              │── Skeletonize background     │
+    │                              │── 15k token payload ────────▶│
+    │                              │                              │
+    │                              │◀──── Streaming response ─────│
+    │◀── Streaming response ──────│                              │
+    │                              │                              │
+    │                              │── Dashboard: saved $2.45! 💰 │
+```
+
+### Before (Heavy Token Cost):
+```python
+def calculate_tax(amount: float, region: str) -> float:
+    """Calculates regional tax rates based on complex logic."""
+    rate = get_base_rate(region)
+    adjustments = fetch_adjustments(region, amount)
+    if amount > THRESHOLD:
+        rate *= 1.05
+    # ... 50 more lines of complex math ...
+    return final_tax
+```
+
+### After (Lightweight Skeleton):
+```python
+# [TOKEN-GUARD: Compressed — structural skeleton only]
+def calculate_tax(amount: float, region: str) -> float: ...
+```
+
+The LLM still knows `calculate_tax` exists and how to call it, but doesn't waste tokens reading the implementation.
+
+## ⚙️ Configuration
+
+Create a `config.yaml` in your working directory:
+
+```yaml
+proxy:
+  host: "127.0.0.1"
+  port: 8000
+
+upstream:
+  openai_url: "https://api.openai.com"
+  anthropic_url: "https://api.anthropic.com"
+
+skeletonizer:
+  keep_docstrings: false      # Preserve function docstrings?
+  keep_class_attrs: true      # Keep class-level attributes?
+
+pricing:                       # Per 1M tokens for cost estimation
+  gpt-4o:
+    input: 2.50
+    output: 10.00
+  claude-sonnet-4-20250514:
+    input: 3.00
+    output: 15.00
+```
+
+## 🛠 Supported APIs
+
+| Provider  | Endpoint                  | Status |
+|-----------|--------------------------|--------|
+| OpenAI    | `/v1/chat/completions`   | ✅     |
+| OpenAI    | `/v1/completions`        | ✅ (pass-through) |
+| OpenAI    | `/v1/models`             | ✅ (pass-through) |
+| Anthropic | `/v1/messages`           | ✅     |
+
+## 📋 Requirements
+
+- Python 3.10+
+- Dependencies: FastAPI, uvicorn, httpx, tiktoken, rich, pyyaml
+
+## 📜 License
+
+MIT

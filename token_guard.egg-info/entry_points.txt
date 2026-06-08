@@ -1,0 +1,2 @@
+[console_scripts]
+token-guard = token_guard.__main__:main

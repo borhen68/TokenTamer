@@ -1,0 +1,53 @@
+# ─────────────────────────────────────────────────────────
+# 🚀 Token-Guard Configuration
+# ─────────────────────────────────────────────────────────
+
+proxy:
+  host: "127.0.0.1"
+  port: 8000
+
+upstream:
+  openai_url: "https://api.openai.com"
+  anthropic_url: "https://api.anthropic.com"
+
+# API keys: can also be set via environment variables
+# OPENAI_API_KEY and ANTHROPIC_API_KEY
+api_keys:
+  openai: ""
+  anthropic: ""
+
+skeletonizer:
+  # Whether to preserve docstrings in skeletonized functions
+  keep_docstrings: false
+  # Whether to preserve class-level attributes (not method bodies)
+  keep_class_attrs: true
+
+# Pricing per 1M tokens (input / output) for cost estimation
+pricing:
+  gpt-4o:
+    input: 2.50
+    output: 10.00
+  gpt-4o-mini:
+    input: 0.15
+    output: 0.60
+  gpt-4-turbo:
+    input: 10.00
+    output: 30.00
+  gpt-3.5-turbo:
+    input: 0.50
+    output: 1.50
+  claude-3-5-sonnet-20241022:
+    input: 3.00
+    output: 15.00
+  claude-3-opus-20240229:
+    input: 15.00
+    output: 75.00
+  claude-3-haiku-20240307:
+    input: 0.25
+    output: 1.25
+  claude-sonnet-4-20250514:
+    input: 3.00
+    output: 15.00
+  default:
+    input: 3.00
+    output: 15.00
