@@ -600,3 +600,129 @@ class TestToolAwareCompression:
         forwarded = mock_post.call_args.kwargs["json"]
         # With smart compression disabled and tools present → no compression
         assert forwarded["messages"][0]["content"] == original_msg
+
+
+# ──────────────────────────────────────────────────────────
+#  Long-Lived Session Hijacking via prompt caching
+# ──────────────────────────────────────────────────────────
+
+
+class TestSessionCacheIntegration:
+    @patch("httpx.AsyncClient.post")
+    def test_anthropic_request_gets_cache_breakpoints(
+        self, mock_post, client: TestClient
+    ):
+        """Multi-turn Anthropic request should have cache_control injected."""
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"id": "m"}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "system": "You are a helpful coding assistant.",
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "user", "content": "Fix payment.py"},
+                {"role": "assistant", "content": "Looking now..."},
+                {"role": "user", "content": "Anything else?"},
+                {"role": "assistant", "content": "I see one issue."},
+                {"role": "user", "content": "Apply the fix."},
+            ],
+        }
+
+        response = client.post("/v1/messages", json=payload)
+        assert response.status_code == 200
+
+        # Response headers expose breakpoint count
+        assert int(response.headers["X-TokenTamer-Cache-Breakpoints"]) >= 2
+        assert int(response.headers["X-TokenTamer-Cache-Tokens"]) > 0
+
+        # The forwarded payload should contain cache_control markers
+        forwarded = mock_post.call_args.kwargs["json"]
+
+        # Tools array tagged
+        assert forwarded["tools"][-1].get("cache_control") == {"type": "ephemeral"}
+
+        # System prompt promoted to list with cache_control
+        assert isinstance(forwarded["system"], list)
+        assert any(
+            isinstance(b, dict) and "cache_control" in b
+            for b in forwarded["system"]
+        )
+
+        # Some message in the prefix has cache_control
+        prefix_markers = 0
+        for msg in forwarded["messages"][:-2]:  # exclude last 2 (trailing)
+            content = msg.get("content")
+            if isinstance(content, list):
+                for blk in content:
+                    if isinstance(blk, dict) and "cache_control" in blk:
+                        prefix_markers += 1
+        assert prefix_markers >= 1
+
+    @patch("httpx.AsyncClient.post")
+    def test_no_session_cache_flag_disables_breakpoints(
+        self, mock_post, config, metrics
+    ):
+        """--no-session-cache should leave the body untouched."""
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"id": "m"}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        app = create_app(config, metrics, session_cache_enabled=False)
+        client = TestClient(app)
+
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "more"},
+            ],
+        }
+
+        response = client.post("/v1/messages", json=payload)
+        assert response.status_code == 200
+        forwarded = mock_post.call_args.kwargs["json"]
+
+        # No cache_control anywhere
+        assert forwarded["system"] == "You are helpful."  # not promoted to list
+        for msg in forwarded["messages"]:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for blk in content:
+                    if isinstance(blk, dict):
+                        assert "cache_control" not in blk
+
+    @patch("httpx.AsyncClient.post")
+    def test_short_conversation_skips_caching(self, mock_post, client: TestClient):
+        """Single-turn conversations shouldn't get caching (no benefit)."""
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"id": "m"}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "messages": [
+                {"role": "user", "content": "what's 2+2?"},
+            ],
+        }
+
+        response = client.post("/v1/messages", json=payload)
+        assert response.status_code == 200
+        # 1 message < MIN_MESSAGES_TO_CACHE → no conversation breakpoint
+        # (system/tools breakpoints could still fire but neither is present)
+        forwarded = mock_post.call_args.kwargs["json"]
+        for msg in forwarded["messages"]:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for blk in content:
+                    if isinstance(blk, dict):
+                        assert "cache_control" not in blk

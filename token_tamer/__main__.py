@@ -77,6 +77,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-session-cache",
+        action="store_true",
+        help=(
+            "Disable long-lived session hijacking via prompt caching. "
+            "Enabled by default — injects cache_control breakpoints into "
+            "Anthropic requests so the conversation prefix is reused, "
+            "delivering up to a 90% discount on input tokens for long sessions."
+        ),
+    )
+    parser.add_argument(
         "--version", "-v",
         action="version",
         version=f"{__app_name__} {__version__}",
@@ -131,6 +141,7 @@ def main() -> None:
         ssl_mode=args.ssl,
         passthrough=args.passthrough,
         compress_with_tools=not args.no_tool_compression,
+        session_cache_enabled=not args.no_session_cache,
     )
 
     if args.passthrough:

@@ -11,7 +11,14 @@ All notable changes to this project will be documented in this file.
 - New `/v1/responses` endpoint for the OpenAI Responses API (used by Codex CLI).
 - `--passthrough` flag: kill-switch that disables all compression while still proxying.
 - `--no-tool-compression` flag: disable smart tool-aware path only.
-- 11 new integration tests covering tool safety, Responses API, and stale-read skeletonization.
+- **Long-lived session hijacking** — Exploits Anthropic prompt caching (`cache_control` breakpoints).
+  Injected into outbound Anthropic requests: tools array, system prompt, and conversation
+  prefix all get `cache_control` markers. Cached input tokens cost **$0.30/Mtoken** vs $3.00/Mtoken
+  regular — up to a 90% discount on long Claude Code sessions.
+- `--no-session-cache` flag to disable prompt caching injection.
+- 20 unit + integration tests for session cache covering breakpoint placement, idempotency,
+  session tracking, token estimation, and robustness against malformed payloads.
+- 3 integration tests verifying server-level cache header injection and opt-out behavior.
 
 ### Changed
 - Tool definitions, `tool_use` blocks, and the latest `tool_result` per file are

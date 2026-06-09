@@ -40,15 +40,17 @@ token-tamer --ssl --port 443 --no-tool-compression    # disable only tool-aware 
 ## 🗺️ Roadmap
 
 - [x] **v0.2** — Tool-aware compression (✅ shipped)
-- [ ] **v0.3** — Multi-turn / cross-request cache so repeat content isn't re-sent
+- [x] **v0.3** — Anthropic prompt caching / long-lived session hijacking (✅ shipped)
 - [ ] **v0.4** — Tree-sitter for proper multi-language AST (current C-style support is a brace-balance heuristic)
-- [ ] **v0.5** — Web dashboard with per-file compression heatmap
+- [ ] **v0.5** — Web dashboard with per-file compression heatmap + live cache hit metrics
 
 ## ✨ Features
 
 - **🔌 Drop-in proxy** — No changes needed to your coding agent. Just change the API base URL.
+- **🔁 Long-lived session hijacking** — Injects Anthropic `cache_control` breakpoints into outbound requests. Long Claude Code sessions see up to **90% off input tokens** (cached input is `$0.30/Mtoken` vs `$3.00/Mtoken` regular).
 - **🧠 Smart active file detection** — Automatically identifies which files you're working on and leaves them 100% intact.
 - **🌳 AST-based compression** — Strips function bodies while preserving signatures, imports, and class structures.
+- **🔧 Tool-aware compression** — Skeletonizes stale `tool_result` reads while preserving the latest read of each file. Safe with agents that use function calling.
 - **💰 Real-time cost tracking** — Beautiful terminal dashboard showing tokens saved and money saved.
 - **🔄 Full streaming support** — Transparent SSE streaming for both OpenAI and Anthropic APIs.
 - **⚡ Zero latency overhead** — Compression happens locally in milliseconds.
@@ -205,6 +207,56 @@ def calculate_tax(amount: float, region: str) -> float: ...
 ```
 
 The LLM still knows `calculate_tax` exists and how to call it, but doesn't waste tokens reading the implementation.
+
+## 🔁 Long-Lived Session Hijacking (Anthropic Prompt Caching)
+
+This is TokenTamer's most powerful cost-cutting feature. Anthropic offers a **90% discount** on cached input tokens:
+
+| Token type | Price per 1M tokens |
+|------------|--------------------|
+| Regular input | $3.00 |
+| **Cached input** | **$0.30** |
+
+The catch: Claude Code (and most agents) don't use it well. They mutate the conversation prefix every turn, so the cache never hits. TokenTamer fixes this.
+
+### How it works
+
+**Without TokenTamer** — each turn re-sends the entire conversation:
+```
+Turn 5: [sys, tools, msg1, msg2, msg3, msg4, msg5] → $$$$
+Turn 6: [sys, tools, msg1, msg2, msg3, msg4, msg5, msg6] → $$$$$
+Turn 7: [sys, tools, msg1...msg7] → $$$$$$$
+```
+
+**With TokenTamer** — stable prefix cached, only new messages billed:
+```
+Turn 5: [sys, tools, msg1, msg2, msg3] [msg4, msg5] → cache | $$
+Turn 6: [sys, tools, msg1, msg2, msg3] [msg4, msg5, msg6] → cache | $$
+Turn 7: [sys, tools, msg1, msg2, msg3] [msg4, msg5, msg6, msg7] → cache | $$
+```
+
+TokenTamer injects `cache_control` breakpoints at three stable positions:
+1. **After tools array** — rarely changes between turns
+2. **After system prompt** — fixed for the whole session
+3. **After conversation prefix** — everything except the last 2 turns
+
+Result: a 50-turn Claude Code session drops from ~$5.00 to ~$0.50. **Same model. Same reasoning. Same output.** Just smarter billing.
+
+### Verification
+
+When active, every Anthropic response includes cache headers:
+```bash
+curl -I http://127.0.0.1:8000/v1/messages ...
+# X-TokenTamer-Cache-Breakpoints: 3
+# X-TokenTamer-Cache-Tokens: 12400
+```
+
+### Opt-out
+
+If you ever need to disable it:
+```bash
+token-tamer --no-session-cache
+```
 
 ## ⚙️ Configuration
 

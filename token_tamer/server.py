@@ -24,6 +24,7 @@ from . import __version__
 from .config import Config
 from .context_analyzer import ContextAnalyzer
 from .dashboard import Dashboard
+from .session_cache import SessionCache
 from .skeletonizer import Skeletonizer
 from .token_counter import (
     FileStats,
@@ -72,6 +73,7 @@ def create_app(
     ssl_mode: bool = False,
     passthrough: bool = False,
     compress_with_tools: bool = True,
+    session_cache_enabled: bool = True,
 ) -> FastAPI:
     """
     Create and configure the FastAPI application.
@@ -99,6 +101,7 @@ def create_app(
     )
     analyzer = ContextAnalyzer(skeletonizer, repo_path=config.repo_path)
     counter = TokenCounter()
+    session_cache = SessionCache()
 
     # Shared HTTP client (connection pooling)
     http_client = httpx.AsyncClient(
@@ -378,6 +381,21 @@ def create_app(
 
         metrics.record_request(req_metrics, cost_saved)
 
+        # ── Long-lived session hijacking via prompt caching ──
+        cache_info = {"breakpoints": 0, "cached_tokens_estimate": 0}
+        if session_cache_enabled and not passthrough:
+            try:
+                body, cache_info = session_cache.apply(body)
+                if cache_info["breakpoints"] > 0:
+                    logger.info(
+                        f"Session cache: session={cache_info['session_id']} "
+                        f"turn={cache_info['turn_count']} "
+                        f"breakpoints={cache_info['breakpoints']} "
+                        f"cached_tokens≈{cache_info['cached_tokens_estimate']}"
+                    )
+            except Exception as e:
+                logger.warning(f"Session cache injection failed: {e}. Forwarding without it.")
+
         # ── Forward to upstream ──
         upstream_url = f"{config.upstream.anthropic_url}/v1/messages"
         forward_headers = {
@@ -391,6 +409,10 @@ def create_app(
             if key.startswith("anthropic-") and key != "anthropic-version":
                 forward_headers[key] = value
 
+        cache_headers = {
+            "X-TokenTamer-Cache-Breakpoints": str(cache_info["breakpoints"]),
+            "X-TokenTamer-Cache-Tokens": str(cache_info["cached_tokens_estimate"]),
+        }
         if is_streaming:
             return StreamingResponse(
                 _stream_proxy(http_client, upstream_url, forward_headers, body),
@@ -399,6 +421,7 @@ def create_app(
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                     "X-TokenTamer-Saved": str(req_metrics.tokens_saved),
+                    **cache_headers,
                 },
             )
         else:
@@ -413,6 +436,7 @@ def create_app(
                 headers={
                     "Content-Type": response.headers.get("content-type", "application/json"),
                     "X-TokenTamer-Saved": str(req_metrics.tokens_saved),
+                    **cache_headers,
                 },
             )
 
