@@ -18,6 +18,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.columns import Columns
+
+from . import __version__
 from rich import box
 
 from .token_counter import SessionMetrics, RequestMetrics, FileStats
@@ -198,7 +200,7 @@ class Dashboard:
         self._console.print()
         banner = Panel(
             Group(
-                Text("🚀 TokenTamer v0.1.0", style="bold bright_cyan", justify="center"),
+                Text(f"🚀 TokenTamer v{__version__}", style="bold bright_cyan", justify="center"),
                 Text("Smart Context-Aware Token Compactor", style="dim italic", justify="center"),
                 Text("", justify="center"),
                 Text(

@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2024-06-09
+
+### Added
+- **Tool-aware compression** — Claude Code and Codex CLI now get real savings.
+  TokenTamer tracks `tool_use → file_path` mappings and skeletonizes stale
+  `tool_result` file reads while preserving the most recent read of each file.
+- New `/v1/responses` endpoint for the OpenAI Responses API (used by Codex CLI).
+- `--passthrough` flag: kill-switch that disables all compression while still proxying.
+- `--no-tool-compression` flag: disable smart tool-aware path only.
+- 11 new integration tests covering tool safety, Responses API, and stale-read skeletonization.
+
+### Changed
+- Tool definitions, `tool_use` blocks, and the latest `tool_result` per file are
+  never modified — this is now the default behavior, not a special "safety mode".
+
 ## [0.1.0] - 2024-06-08
 
 ### Added

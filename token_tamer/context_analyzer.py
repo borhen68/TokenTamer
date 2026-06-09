@@ -193,6 +193,14 @@ class ContextAnalyzer:
 
         for msg in messages:
             raw_content = msg.get("content", "")
+            role = msg.get("role", "")
+
+            # SAFETY: Never modify tool/function result messages.
+            # These contain structured output that the agent relies on.
+            if role in ("tool", "function", "tool_use", "tool_result"):
+                modified_messages.append(msg.copy())
+                continue
+
             if not raw_content:
                 modified_messages.append(msg.copy())
                 continue
@@ -203,7 +211,8 @@ class ContextAnalyzer:
                 modified_content = self._process_content(raw_content, active_files, result)
                 new_msg["content"] = modified_content
             elif isinstance(raw_content, list):
-                # Multi-part content: modify each text part individually
+                # Multi-part content: modify each text part individually.
+                # NEVER touch non-text parts (tool_use, tool_result, image, etc).
                 new_parts = []
                 for part in raw_content:
                     if isinstance(part, dict) and part.get("type") == "text":
@@ -213,6 +222,7 @@ class ContextAnalyzer:
                         )
                         new_parts.append(new_part)
                     else:
+                        # Pass through tool_use, tool_result, image, etc. untouched
                         new_parts.append(part)
                 new_msg["content"] = new_parts
 
@@ -220,6 +230,207 @@ class ContextAnalyzer:
 
         result.modified_content = str(modified_messages)
         return modified_messages, result
+
+    # ──────────────────────────────────────────────────────────
+    #  Tool-aware compression (Phase 2)
+    # ──────────────────────────────────────────────────────────
+
+    def analyze_and_compress_tool_aware(
+        self,
+        messages: List[dict],
+        all_messages: Optional[List[dict]] = None,
+        keep_last_n_tool_reads: int = 1,
+    ) -> Tuple[List[dict], AnalysisResult]:
+        """Compress messages while preserving tool/function-calling integrity.
+
+        Strategy:
+          1. Walk messages forward, tracking every (tool_use_id → file_path) mapping
+             extracted from tool_use input args.
+          2. For each file referenced by multiple tool_results, keep the **last N**
+             results intact and skeletonize the older ones.
+          3. Compress code blocks inside plain text parts (user/assistant text)
+             using the standard active-file detection.
+          4. NEVER touch:
+                - tool definitions in `tools=[...]`
+                - tool_use blocks (the tool calls themselves)
+                - the most recent tool_result for each file
+                - non-file tool_results (shell commands, web fetches, etc.)
+
+        Args:
+            messages: The full messages list (may include tool_use / tool_result).
+            all_messages: Optional superset for active-file detection.
+            keep_last_n_tool_reads: How many recent reads per file to keep intact.
+
+        Returns:
+            (modified_messages, AnalysisResult)
+        """
+        active_files = self.extract_active_files(all_messages or messages)
+        result = AnalysisResult(active_files=active_files)
+
+        # ── Pass 1: build (tool_use_id → file_path) and per-file occurrence list ──
+        tool_use_to_file: dict = {}
+        file_to_result_positions: dict = {}  # file → list[(msg_idx, part_idx)]
+
+        for msg_idx, msg in enumerate(messages):
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for part_idx, part in enumerate(content):
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype == "tool_use":
+                    fp = self._extract_filepath_from_tool_input(part.get("input"))
+                    if fp:
+                        tool_use_to_file[part.get("id")] = fp
+                elif ptype == "tool_result":
+                    use_id = part.get("tool_use_id")
+                    fp = tool_use_to_file.get(use_id)
+                    if fp:
+                        file_to_result_positions.setdefault(fp, []).append(
+                            (msg_idx, part_idx)
+                        )
+
+        # ── Pass 2: decide which tool_result positions to skeletonize ──
+        positions_to_skeletonize: set = set()
+        for fp, positions in file_to_result_positions.items():
+            if len(positions) <= keep_last_n_tool_reads:
+                continue  # Only one read, leave it alone
+            # Keep the LAST N intact; skeletonize the rest
+            stale = positions[: -keep_last_n_tool_reads]
+            for pos in stale:
+                positions_to_skeletonize.add(pos)
+
+        # ── Pass 3: rebuild messages with selective compression ──
+        modified_messages = []
+        for msg_idx, msg in enumerate(messages):
+            raw_content = msg.get("content", "")
+            role = msg.get("role", "")
+
+            # Tool/function role messages with plain string content → leave intact
+            if role in ("tool", "function") and isinstance(raw_content, str):
+                modified_messages.append(msg.copy())
+                continue
+
+            if not raw_content:
+                modified_messages.append(msg.copy())
+                continue
+
+            new_msg = msg.copy()
+
+            if isinstance(raw_content, str):
+                # Plain text — compress code blocks normally
+                new_msg["content"] = self._process_content(
+                    raw_content, active_files, result
+                )
+            elif isinstance(raw_content, list):
+                new_parts = []
+                for part_idx, part in enumerate(raw_content):
+                    if not isinstance(part, dict):
+                        new_parts.append(part)
+                        continue
+
+                    ptype = part.get("type")
+
+                    if ptype == "text":
+                        # Compress code blocks inside text parts
+                        new_part = part.copy()
+                        new_part["text"] = self._process_content(
+                            part.get("text", ""), active_files, result
+                        )
+                        new_parts.append(new_part)
+
+                    elif ptype == "tool_result" and (msg_idx, part_idx) in positions_to_skeletonize:
+                        # Stale file read — replace content with skeleton
+                        new_part = part.copy()
+                        fp = tool_use_to_file.get(part.get("tool_use_id"))
+                        new_part["content"] = self._skeletonize_tool_result_content(
+                            part.get("content"), fp, result
+                        )
+                        new_parts.append(new_part)
+
+                    else:
+                        # tool_use, latest tool_result, image, etc. → pass through
+                        new_parts.append(part)
+
+                new_msg["content"] = new_parts
+
+            modified_messages.append(new_msg)
+
+        result.modified_content = str(modified_messages)
+        return modified_messages, result
+
+    @staticmethod
+    def _extract_filepath_from_tool_input(tool_input) -> Optional[str]:
+        """Heuristically find a file path inside a tool_use input dict.
+
+        Looks for common key names used by Claude Code, Codex, Aider, etc.
+        Falls back to scanning string values for path-like tokens.
+        """
+        if not isinstance(tool_input, dict):
+            return None
+
+        # Common keys across agents
+        for key in (
+            "file_path", "filepath", "path", "filename", "file",
+            "target_file", "absolute_path",
+        ):
+            value = tool_input.get(key)
+            if isinstance(value, str) and value:
+                return value
+
+        # Fallback: look at any string value that resembles a code file
+        for value in tool_input.values():
+            if isinstance(value, str):
+                for pattern in FILE_REFERENCE_PATTERNS:
+                    m = pattern.search(value)
+                    if m and m.group(1):
+                        return m.group(1)
+        return None
+
+    def _skeletonize_tool_result_content(
+        self, content, filepath: Optional[str], result: AnalysisResult,
+    ):
+        """Compress the content of a stale tool_result.
+
+        Handles both string content (`{"content": "..."}`) and the Anthropic
+        list-of-blocks format (`{"content": [{"type": "text", "text": "..."}]}`).
+        """
+        language = ""
+        if filepath:
+            ext = "." + filepath.rsplit(".", 1)[-1] if "." in filepath else ""
+            language = EXTENSION_TO_LANGUAGE.get(ext, "")
+
+        replacement_note = (
+            f"[TokenTamer: stale tool_result for `{filepath}` "
+            f"replaced with skeleton — a newer read of this file appears later "
+            f"in the conversation]\n"
+        ) if filepath else "[TokenTamer: stale tool_result skeletonized]\n"
+
+        def _compress_text(text: str) -> str:
+            if not isinstance(text, str) or not text.strip():
+                return text
+            skel = self.skeletonizer.skeletonize(text, language=language)
+            if skel.was_compressed:
+                result.skeletonized_blocks += 1
+                return replacement_note + skel.skeleton
+            return text
+
+        if isinstance(content, str):
+            result.total_blocks += 1
+            return _compress_text(content)
+        if isinstance(content, list):
+            new_blocks = []
+            for blk in content:
+                if isinstance(blk, dict) and blk.get("type") == "text":
+                    result.total_blocks += 1
+                    new_blk = blk.copy()
+                    new_blk["text"] = _compress_text(blk.get("text", ""))
+                    new_blocks.append(new_blk)
+                else:
+                    new_blocks.append(blk)
+            return new_blocks
+        return content
 
     def _process_content(
         self, content: str, active_files: Set[str], result: AnalysisResult

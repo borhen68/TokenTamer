@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "token-tamer"
-version = "0.1.0"
+version = "0.2.0"
 description = "A drop-in proxy that compresses bloated code context in real-time, cutting LLM API costs by 50–80%."
 readme = "README.md"
 requires-python = ">=3.9"

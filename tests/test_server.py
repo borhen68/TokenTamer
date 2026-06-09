@@ -41,7 +41,8 @@ class TestHealth:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "ok"
-        assert data["version"] == "0.1.0"
+        from token_tamer import __version__
+        assert data["version"] == __version__
         assert data["requests_processed"] == 0
 
 
@@ -184,3 +185,418 @@ class TestMetrics:
 
         assert metrics.total_requests == 1
         assert metrics.tokens_saved >= 0
+
+
+# ──────────────────────────────────────────────────────────
+#  Safety guard tests: tool/function-call requests
+# ──────────────────────────────────────────────────────────
+
+
+def _heavy_code_block() -> str:
+    return (
+        "```python\n# File: utils.py\n"
+        "def helper():\n"
+        "    x = 1\n"
+        "    y = 2\n"
+        "    z = 3\n"
+        "    return x + y + z\n"
+        "```"
+    )
+
+
+class TestToolSafety:
+    @patch("httpx.AsyncClient.post")
+    def test_openai_tools_request_uses_smart_compression(
+        self, mock_post, client: TestClient
+    ):
+        """With tools present, plain-text code blocks should still be compressed."""
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"id": "x", "choices": []}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        original_msg = f"Refactor it\n\n{_heavy_code_block()}"
+        payload = {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": original_msg}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "edit_file", "parameters": {}},
+                }
+            ],
+        }
+
+        response = client.post("/v1/chat/completions", json=payload)
+        assert response.status_code == 200
+        forwarded = mock_post.call_args.kwargs["json"]
+        # Tools present BUT it's a plain user message → smart compression skeletonizes
+        assert "..." in forwarded["messages"][0]["content"]
+
+    @patch("httpx.AsyncClient.post")
+    def test_anthropic_tool_use_part_is_preserved(self, mock_post, client: TestClient):
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"id": "m", "content": []}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": f"Looking at code\n{_heavy_code_block()}"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "str_replace",
+                            "input": {"path": "utils.py"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_1",
+                         "content": "ok"},
+                    ],
+                },
+            ],
+            "tools": [{"name": "str_replace", "input_schema": {"type": "object"}}],
+        }
+
+        response = client.post("/v1/messages", json=payload)
+        assert response.status_code == 200
+        forwarded = mock_post.call_args.kwargs["json"]
+        # tool_use & tool_result parts must be present untouched
+        assistant_parts = forwarded["messages"][0]["content"]
+        kinds = [p.get("type") for p in assistant_parts]
+        assert "tool_use" in kinds
+        tool_result = forwarded["messages"][1]["content"][0]
+        assert tool_result["type"] == "tool_result"
+        assert tool_result["tool_use_id"] == "toolu_1"
+
+
+class TestPassthroughMode:
+    @patch("httpx.AsyncClient.post")
+    def test_passthrough_skips_compression(
+        self, mock_post, config, metrics
+    ):
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"id": "x"}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        app = create_app(config, metrics, passthrough=True)
+        client = TestClient(app)
+
+        original_msg = f"Refactor it\n\n{_heavy_code_block()}"
+        client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": original_msg}],
+            },
+        )
+
+        forwarded = mock_post.call_args.kwargs["json"]
+        assert forwarded["messages"][0]["content"] == original_msg
+
+
+# ──────────────────────────────────────────────────────────
+#  Responses API (Codex CLI)
+# ──────────────────────────────────────────────────────────
+
+
+class TestResponsesAPI:
+    @patch("httpx.AsyncClient.post")
+    def test_responses_string_input_is_compressed(self, mock_post, client: TestClient):
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"id": "resp_1"}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        payload = {
+            "model": "gpt-4o",
+            "input": (
+                f"Fix payment.py\n\n"
+                f"```python\n# File: payment.py\ndef calc():\n    return 1+1\n```\n\n"
+                f"{_heavy_code_block()}"
+            ),
+        }
+
+        response = client.post("/v1/responses", json=payload)
+        assert response.status_code == 200
+        forwarded = mock_post.call_args.kwargs["json"]
+        assert "..." in forwarded["input"]  # utils.py skeletonized
+        assert "payment.py" in forwarded["input"]
+
+    @patch("httpx.AsyncClient.post")
+    def test_responses_list_input_preserves_tool_items(self, mock_post, client: TestClient):
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"id": "resp_2"}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        payload = {
+            "model": "gpt-4o",
+            "input": [
+                {"role": "user", "content": f"hi\n{_heavy_code_block()}"},
+                {"type": "function_call", "name": "shell",
+                 "arguments": "{\"cmd\":\"ls\"}", "call_id": "c1"},
+                {"type": "function_call_output",
+                 "call_id": "c1", "output": "file.py"},
+            ],
+        }
+
+        response = client.post("/v1/responses", json=payload)
+        assert response.status_code == 200
+        forwarded = mock_post.call_args.kwargs["json"]
+        kinds = [
+            item.get("type") if isinstance(item, dict) else None
+            for item in forwarded["input"]
+        ]
+        # tool items preserved at correct positions
+        assert "function_call" in kinds
+        assert "function_call_output" in kinds
+
+    @patch("httpx.AsyncClient.post")
+    def test_responses_with_tools_still_compresses_text(
+        self, mock_post, client: TestClient
+    ):
+        """Responses API with tools should still skeletonize plain code blocks."""
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"id": "resp_3"}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        original = f"Refactor\n{_heavy_code_block()}"
+        payload = {
+            "model": "gpt-4o",
+            "input": original,
+            "tools": [{"type": "function", "name": "shell"}],
+        }
+
+        response = client.post("/v1/responses", json=payload)
+        assert response.status_code == 200
+        forwarded = mock_post.call_args.kwargs["json"]
+        # With smart compression, plain code blocks ARE compressed even with tools
+        assert "..." in forwarded["input"]
+
+
+# ──────────────────────────────────────────────────────────
+#  Phase 2: Tool-aware compression
+# ──────────────────────────────────────────────────────────
+
+
+def _file_dump(filename: str, body: str = None) -> str:
+    body = body or (
+        "def calculate_tax(amount, region):\n"
+        "    rate = get_base_rate(region)\n"
+        "    adjustments = fetch_adjustments(region, amount)\n"
+        "    if amount > 10000:\n"
+        "        rate *= 1.05\n"
+        "    subtotal = amount * rate\n"
+        "    for adj in adjustments:\n"
+        "        subtotal += adj.value\n"
+        "    return round(subtotal, 2)\n"
+    )
+    return body
+
+
+class TestToolAwareCompression:
+    @patch("httpx.AsyncClient.post")
+    def test_stale_tool_result_is_skeletonized(self, mock_post, client: TestClient):
+        """When a file is read twice, the older tool_result should be skeletonized."""
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"id": "m"}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        file_body = _file_dump("payment.py")
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "user", "content": "Fix payment.py"},
+                # First read
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Read",
+                     "input": {"file_path": "payment.py"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1",
+                     "content": file_body},
+                ]},
+                # Some intermediate chatter
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Let me re-read the file"},
+                ]},
+                # Second read of SAME file
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t2", "name": "Read",
+                     "input": {"file_path": "payment.py"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t2",
+                     "content": file_body},
+                ]},
+            ],
+        }
+
+        response = client.post("/v1/messages", json=payload)
+        assert response.status_code == 200
+        forwarded = mock_post.call_args.kwargs["json"]
+        msgs = forwarded["messages"]
+
+        # First tool_result (msg index 2) should be skeletonized
+        first_result_content = msgs[2]["content"][0]["content"]
+        assert "TokenTamer: stale tool_result" in first_result_content
+        assert "..." in first_result_content
+
+        # Last tool_result (msg index 5) should be UNTOUCHED
+        last_result_content = msgs[5]["content"][0]["content"]
+        assert last_result_content == file_body
+
+    @patch("httpx.AsyncClient.post")
+    def test_single_tool_result_is_preserved(self, mock_post, client: TestClient):
+        """A file read only once should never be skeletonized."""
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"id": "m"}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        file_body = _file_dump("only_once.py")
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "user", "content": "Look at only_once.py"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Read",
+                     "input": {"file_path": "only_once.py"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1",
+                     "content": file_body},
+                ]},
+            ],
+        }
+
+        response = client.post("/v1/messages", json=payload)
+        assert response.status_code == 200
+        forwarded = mock_post.call_args.kwargs["json"]
+        # Single read → preserved
+        assert forwarded["messages"][2]["content"][0]["content"] == file_body
+
+    @patch("httpx.AsyncClient.post")
+    def test_tool_use_blocks_are_never_touched(self, mock_post, client: TestClient):
+        """tool_use blocks (the command itself) must always pass through intact."""
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"id": "m"}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "tools": [{"name": "Edit", "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "u1", "name": "Edit",
+                     "input": {"file_path": "x.py", "old_str": "a", "new_str": "b"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "u1", "content": "ok"},
+                ]},
+            ],
+        }
+
+        response = client.post("/v1/messages", json=payload)
+        assert response.status_code == 200
+        forwarded = mock_post.call_args.kwargs["json"]
+        tool_use = forwarded["messages"][0]["content"][0]
+        assert tool_use["type"] == "tool_use"
+        assert tool_use["input"]["old_str"] == "a"
+        assert tool_use["input"]["new_str"] == "b"
+
+    @patch("httpx.AsyncClient.post")
+    def test_anthropic_list_format_tool_result(self, mock_post, client: TestClient):
+        """tool_result with list-of-blocks content format should work too."""
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"id": "m"}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        file_body = _file_dump("foo.py")
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+            "messages": [
+                # Read 1
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Read",
+                     "input": {"path": "foo.py"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1",
+                     "content": [{"type": "text", "text": file_body}]},
+                ]},
+                # Read 2
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t2", "name": "Read",
+                     "input": {"path": "foo.py"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t2",
+                     "content": [{"type": "text", "text": file_body}]},
+                ]},
+            ],
+        }
+
+        response = client.post("/v1/messages", json=payload)
+        assert response.status_code == 200
+        forwarded = mock_post.call_args.kwargs["json"]
+        # First read's text block should have skeleton marker
+        first = forwarded["messages"][1]["content"][0]["content"][0]["text"]
+        assert "TokenTamer: stale tool_result" in first
+        # Last read's text block is intact
+        last = forwarded["messages"][3]["content"][0]["content"][0]["text"]
+        assert last == file_body
+
+    @patch("httpx.AsyncClient.post")
+    def test_no_tool_compression_flag_disables_smart_path(
+        self, mock_post, config, metrics
+    ):
+        """--no-tool-compression should fall back to leaving tool requests alone."""
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"id": "m"}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        app = create_app(config, metrics, compress_with_tools=False)
+        client = TestClient(app)
+
+        original_msg = f"Refactor\n{_heavy_code_block()}"
+        client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": original_msg}],
+                "tools": [{"type": "function", "function": {"name": "x"}}],
+            },
+        )
+        forwarded = mock_post.call_args.kwargs["json"]
+        # With smart compression disabled and tools present → no compression
+        assert forwarded["messages"][0]["content"] == original_msg

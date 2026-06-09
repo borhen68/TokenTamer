@@ -18,8 +18,9 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-logger = logging.getLogger("token_guard")
+logger = logging.getLogger("token_tamer")
 
+from . import __version__
 from .config import Config
 from .context_analyzer import ContextAnalyzer
 from .dashboard import Dashboard
@@ -33,11 +34,44 @@ from .token_counter import (
 from . import upstream_resolver
 
 
+def _request_has_tools(body: dict) -> bool:
+    """Detect if the request involves tool/function calling.
+
+    When tools are present, compression is risky because the model may
+    need exact code context to generate correct tool arguments. We bail
+    out to safe pass-through behavior in this case.
+    """
+    if not isinstance(body, dict):
+        return False
+    # OpenAI: tools=[{...}] or functions=[{...}]
+    if body.get("tools") or body.get("functions"):
+        return True
+    if body.get("tool_choice") not in (None, "none"):
+        return True
+    # Anthropic: tools=[{...}]
+    # (Same key, already covered above.)
+    # Tool result messages embedded in history
+    for msg in body.get("messages", []) or []:
+        if isinstance(msg, dict):
+            if msg.get("role") in ("tool", "function"):
+                return True
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in (
+                        "tool_use", "tool_result",
+                    ):
+                        return True
+    return False
+
+
 def create_app(
     config: Config,
     metrics: SessionMetrics,
     dashboard: Optional[Dashboard] = None,
     ssl_mode: bool = False,
+    passthrough: bool = False,
+    compress_with_tools: bool = True,
 ) -> FastAPI:
     """
     Create and configure the FastAPI application.
@@ -53,7 +87,7 @@ def create_app(
     app = FastAPI(
         title="TokenTamer Proxy",
         description="Smart context-aware token compactor for LLM coding agents",
-        version="0.1.0",
+        version=__version__,
         docs_url=None,  # Disable docs in production proxy
         redoc_url=None,
     )
@@ -92,7 +126,7 @@ def create_app(
     async def health():
         return {
             "status": "ok",
-            "version": "0.1.0",
+            "version": __version__,
             "requests_processed": metrics.total_requests,
             "tokens_saved": metrics.tokens_saved,
         }
@@ -119,14 +153,27 @@ def create_app(
         messages = body.get("messages", [])
         is_streaming = body.get("stream", False)
 
-        # ── Compress ──
-        try:
-            compressed_messages, analysis = analyzer.analyze_and_compress(messages)
-            body["messages"] = compressed_messages
-        except Exception as e:
-            logger.warning(f"Compression failed: {e}. Forwarding original payload.")
-            compressed_messages = messages
-            analysis = None
+        # ── Compress (tool-aware) ──
+        compressed_messages = messages
+        analysis = None
+        has_tools = _request_has_tools(body)
+        if passthrough:
+            pass  # No compression at all
+        elif has_tools and not compress_with_tools:
+            pass  # Tools present + smart compression disabled → full passthrough
+        else:
+            try:
+                if has_tools:
+                    compressed_messages, analysis = analyzer.analyze_and_compress_tool_aware(
+                        messages
+                    )
+                else:
+                    compressed_messages, analysis = analyzer.analyze_and_compress(messages)
+                body["messages"] = compressed_messages
+            except Exception as e:
+                logger.warning(f"Compression failed: {e}. Forwarding original payload.")
+                compressed_messages = messages
+                analysis = None
 
         # ── Count tokens and record metrics ──
         original_tokens = counter.count_messages(messages, model)
@@ -273,16 +320,29 @@ def create_app(
                 )
                 all_messages.insert(0, {"role": "system", "content": text_parts})
 
-        # ── Compress ──
-        try:
-            compressed_messages, analysis = analyzer.analyze_and_compress(
-                messages, all_messages=all_messages
-            )
-            body["messages"] = compressed_messages
-        except Exception as e:
-            logger.warning(f"Compression failed: {e}. Forwarding original payload.")
-            compressed_messages = messages
-            analysis = None
+        # ── Compress (tool-aware) ──
+        compressed_messages = messages
+        analysis = None
+        has_tools = _request_has_tools(body)
+        if passthrough:
+            pass
+        elif has_tools and not compress_with_tools:
+            pass
+        else:
+            try:
+                if has_tools:
+                    compressed_messages, analysis = analyzer.analyze_and_compress_tool_aware(
+                        messages, all_messages=all_messages
+                    )
+                else:
+                    compressed_messages, analysis = analyzer.analyze_and_compress(
+                        messages, all_messages=all_messages
+                    )
+                body["messages"] = compressed_messages
+            except Exception as e:
+                logger.warning(f"Compression failed: {e}. Forwarding original payload.")
+                compressed_messages = messages
+                analysis = None
 
         # ── Count tokens and record metrics ──
         original_tokens = counter.count_messages(messages, model)
@@ -357,6 +417,118 @@ def create_app(
             )
 
     # ──────────────────────────────────────────────────────────
+    #  OpenAI Responses API (used by Codex CLI)
+    # ──────────────────────────────────────────────────────────
+
+    @app.post("/v1/responses")
+    async def openai_responses(request: Request):
+        """Intercept OpenAI Responses API (Codex CLI).
+
+        Codex sends `input` (string or list of message objects) instead of
+        `messages`. We compress textual code blocks in user messages only,
+        leaving tool calls and reasoning items untouched.
+        """
+        body = await request.json()
+        headers = dict(request.headers)
+
+        auth_header = headers.get("authorization", "")
+        api_key = auth_header[7:] if auth_header.startswith("Bearer ") else config.get_api_key("openai")
+
+        model = body.get("model", "gpt-4o")
+        is_streaming = body.get("stream", False)
+        raw_input = body.get("input", "")
+
+        # Normalize input → list of pseudo-messages for the analyzer.
+        # The Responses API accepts either a string or a list of items.
+        synthesized: List[dict] = []
+        if isinstance(raw_input, str):
+            synthesized = [{"role": "user", "content": raw_input}]
+        elif isinstance(raw_input, list):
+            for item in raw_input:
+                if isinstance(item, dict):
+                    role = item.get("role", "user")
+                    item_type = item.get("type")
+                    # Skip tool/reasoning items entirely
+                    if item_type in ("function_call", "function_call_output",
+                                       "tool_call", "tool_result", "reasoning"):
+                        continue
+                    content = item.get("content", "")
+                    synthesized.append({"role": role, "content": content})
+
+        has_tools = _request_has_tools(body)
+        skip_compression = passthrough or (has_tools and not compress_with_tools)
+
+        compressed_input = raw_input
+        analysis = None
+        if not skip_compression and synthesized:
+            try:
+                new_msgs, analysis = analyzer.analyze_and_compress(synthesized)
+                # Rebuild input preserving structure
+                if isinstance(raw_input, str) and new_msgs:
+                    first = new_msgs[0].get("content", raw_input)
+                    if isinstance(first, str):
+                        compressed_input = first
+                elif isinstance(raw_input, list):
+                    compressed_input = _rewrite_responses_input(raw_input, new_msgs)
+                body["input"] = compressed_input
+            except Exception as e:
+                logger.warning(f"Responses API compression failed: {e}. Forwarding original.")
+
+        # Best-effort metrics
+        try:
+            original_tokens = counter.count_messages(synthesized, model)
+            compressed_tokens = counter.count_messages(
+                _coerce_to_messages(compressed_input), model
+            )
+        except Exception:
+            original_tokens = compressed_tokens = 0
+
+        req_metrics = RequestMetrics(
+            timestamp=time.time(),
+            original_tokens=original_tokens,
+            compressed_tokens=compressed_tokens,
+            model=model,
+            file_stats=[],
+        )
+        pricing = config.get_pricing(model)
+        original_cost = counter.estimate_cost(original_tokens, 0, pricing.input, pricing.output)
+        compressed_cost = counter.estimate_cost(compressed_tokens, 0, pricing.input, pricing.output)
+        metrics.record_request(req_metrics, original_cost - compressed_cost)
+
+        upstream_url = f"{config.upstream.openai_url}/v1/responses"
+        forward_headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        # Forward OpenAI-Beta and other custom headers
+        for k, v in headers.items():
+            if k.lower().startswith("openai-"):
+                forward_headers[k] = v
+
+        if is_streaming:
+            return StreamingResponse(
+                _stream_proxy(http_client, upstream_url, forward_headers, body),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-TokenTamer-Saved": str(req_metrics.tokens_saved),
+                },
+            )
+        else:
+            response = await http_client.post(
+                upstream_url, headers=forward_headers, json=body,
+            )
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers={
+                    "Content-Type": response.headers.get("content-type", "application/json"),
+                    "X-TokenTamer-Saved": str(req_metrics.tokens_saved),
+                },
+            )
+
+    # ──────────────────────────────────────────────────────────
     #  Catch-all pass-through for unrecognized routes
     # ──────────────────────────────────────────────────────────
 
@@ -419,17 +591,50 @@ async def _stream_proxy(
         yield b"data: [DONE]\n\n"
 
 
-def _compress_messages(
-    messages: List[dict],
-    model: str,
-    analyzer: ContextAnalyzer,
-    counter: TokenCounter,
-    config: Config,
-) -> RequestMetrics:
+def _rewrite_responses_input(
+    raw_input: list,
+    compressed_messages: List[dict],
+) -> list:
+    """Re-merge compressed user/system content back into a Responses API `input` list.
+
+    We only replace text content for items whose role matches one we compressed,
+    preserving order. Tool/reasoning items pass through unchanged.
     """
-    Analyze and compress messages. Returns metrics but note that
-    the actual compression is done by analyzer.analyze_and_compress().
-    This is a helper for the non-streaming path.
-    """
-    # This function is kept for potential future use
-    return RequestMetrics(timestamp=time.time(), model=model)
+    msg_iter = iter(compressed_messages)
+    out: list = []
+    for item in raw_input:
+        if not isinstance(item, dict):
+            out.append(item)
+            continue
+        item_type = item.get("type")
+        if item_type in (
+            "function_call", "function_call_output",
+            "tool_call", "tool_result", "reasoning",
+        ):
+            out.append(item)
+            continue
+        try:
+            replacement = next(msg_iter)
+        except StopIteration:
+            out.append(item)
+            continue
+        new_item = dict(item)
+        new_item["content"] = replacement.get("content", item.get("content"))
+        out.append(new_item)
+    return out
+
+
+def _coerce_to_messages(value) -> List[dict]:
+    """Coerce a Responses API `input` value into a flat messages list for token counting."""
+    if isinstance(value, str):
+        return [{"role": "user", "content": value}]
+    if isinstance(value, list):
+        msgs: List[dict] = []
+        for item in value:
+            if isinstance(item, dict) and "content" in item:
+                msgs.append({
+                    "role": item.get("role", "user"),
+                    "content": item.get("content", ""),
+                })
+        return msgs
+    return []

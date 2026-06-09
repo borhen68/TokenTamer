@@ -60,6 +60,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--passthrough",
+        action="store_true",
+        help=(
+            "Kill-switch: disable all compression. Still proxies and records "
+            "metrics. Use this if an agent breaks and you need a safe fallback."
+        ),
+    )
+    parser.add_argument(
+        "--no-tool-compression",
+        action="store_true",
+        help=(
+            "Disable smart tool-aware compression. When tools are detected, "
+            "forward the request untouched. Use this if smart compression "
+            "ever breaks an agent (please file a bug too)."
+        ),
+    )
+    parser.add_argument(
         "--version", "-v",
         action="version",
         version=f"{__app_name__} {__version__}",
@@ -107,7 +124,19 @@ def main() -> None:
         dashboard = Dashboard(metrics, host=host, port=port)
 
     # Create the FastAPI app
-    app = create_app(config, metrics, dashboard, ssl_mode=args.ssl)
+    app = create_app(
+        config,
+        metrics,
+        dashboard,
+        ssl_mode=args.ssl,
+        passthrough=args.passthrough,
+        compress_with_tools=not args.no_tool_compression,
+    )
+
+    if args.passthrough:
+        logging.getLogger("token_tamer").warning(
+            "⚠️  Passthrough mode enabled — no compression will be applied."
+        )
 
     # Print startup banner
     if dashboard:
