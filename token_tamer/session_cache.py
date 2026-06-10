@@ -106,6 +106,7 @@ class SessionCache:
             "session_id": None,
             "turn_count": 0,
             "cached_tokens_estimate": 0,
+            "prefix_end_index": -1,  # messages[0..prefix_end_index] are cached
         }
 
         if len(messages) < MIN_MESSAGES_TO_CACHE:
@@ -124,8 +125,10 @@ class SessionCache:
         # ── 3. Cache the conversation prefix (all but trailing turns) ──
         remaining_budget = MAX_BREAKPOINTS - breakpoint_count
         if remaining_budget > 0:
-            added = self._mark_conversation_prefix(body, messages)
-            breakpoint_count += added
+            prefix_idx = self._mark_conversation_prefix(body, messages)
+            if prefix_idx >= 0:
+                breakpoint_count += 1
+                info["prefix_end_index"] = prefix_idx
 
         # ── 4. Track the session ──
         session_id = self._fingerprint(messages)
@@ -209,25 +212,28 @@ class SessionCache:
         We deliberately exclude the trailing turn(s) so the cache prefix
         stays maximal even as new turns arrive.
 
-        Returns the number of breakpoints added (0 or 1).
+        Returns the index of the tagged message, or -1 if no breakpoint
+        was added.
         """
         cutoff = len(messages) - KEEP_TRAILING_MESSAGES
         if cutoff < 1:
-            return 0
+            return -1
 
         # Walk backwards from cutoff to find the latest message that's a
         # dict we can safely tag. Non-dict garbage is just skipped.
+        target_idx = None
         target = None
         for i in range(cutoff - 1, -1, -1):
             if isinstance(messages[i], dict):
+                target_idx = i
                 target = messages[i]
                 break
         if target is None:
-            return 0
+            return -1
 
         content = target.get("content")
         if not content:
-            return 0
+            return -1
 
         # Normalize string content → list-of-blocks so we can attach control.
         if isinstance(content, str):
@@ -236,7 +242,7 @@ class SessionCache:
                 "text": content,
                 "cache_control": {"type": "ephemeral"},
             }]
-            return 1
+            return target_idx
 
         if isinstance(content, list):
             # Find the last dict block we can tag, prefer text blocks.
@@ -247,15 +253,15 @@ class SessionCache:
                 if not isinstance(block, dict):
                     continue
                 if "cache_control" in block:
-                    return 0  # Already tagged earlier
+                    return -1  # Already tagged earlier
                 # Some block types (image, document) don't support
                 # cache_control directly — only text/tool_use/tool_result do.
                 if block.get("type") in ("text", "tool_use", "tool_result", "document"):
                     block["cache_control"] = {"type": "ephemeral"}
-                    return 1
-            return 0
+                    return target_idx
+            return -1
 
-        return 0
+        return -1
 
     # ──────────────────────────────────────────────────────────
     #  Session fingerprinting

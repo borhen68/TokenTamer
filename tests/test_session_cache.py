@@ -345,3 +345,69 @@ class TestRobustness:
         # Should not raise
         result, info = cache.apply(body)
         assert info is not None
+
+
+# ──────────────────────────────────────────────────────────
+#  Prefix index tracking (v0.3.1 cache-first fix)
+# ──────────────────────────────────────────────────────────
+
+
+class TestPrefixEndIndex:
+    def test_prefix_end_index_set_for_long_convo(self, cache):
+        msgs = [_msg("user", f"turn {i}") for i in range(6)]
+        body = {"messages": msgs}
+        modified, info = cache.apply(body)
+        # 6 messages, cutoff = 6 - 2 = 4, target index = 3
+        assert info["prefix_end_index"] == 3
+        # Verify the message at index 3 has cache_control
+        target = modified["messages"][3]
+        assert isinstance(target["content"], list)
+        assert target["content"][0]["cache_control"] == {"type": "ephemeral"}
+
+    def test_prefix_end_index_minus_one_for_short_convo(self, cache):
+        body = {"messages": [_msg("user", "hi"), _msg("assistant", "hello")]}
+        _, info = cache.apply(body)
+        assert info["prefix_end_index"] == -1
+
+    def test_multi_turn_prefix_is_stable(self, cache):
+        """Simulate two turns of a conversation and verify the cached prefix
+        messages stay byte-identical across turns. This is the core fix for
+        the 'compress-first breaks cache' bug."""
+        turn1_msgs = [
+            _msg("user", "fix payment.py"),
+            _msg("assistant", "Reading file..."),
+            _msg("user", "what does it do?"),
+            _msg("assistant", "It processes payments."),
+            _msg("user", "refund logic"),
+        ]
+        turn2_msgs = turn1_msgs + [
+            _msg("assistant", "Adding refund method..."),
+            _msg("user", "test it"),
+        ]
+
+        body1 = {"messages": turn1_msgs}
+        body2 = {"messages": turn2_msgs}
+
+        modified1, info1 = cache.apply(body1)
+        modified2, info2 = cache.apply(body2)
+
+        # Both should have a prefix breakpoint
+        assert info1["prefix_end_index"] >= 0
+        assert info2["prefix_end_index"] >= 0
+
+        # The prefix messages (0..prefix_end) should be identical across turns
+        # because they contain the same content and same cache_control tags
+        end1 = info1["prefix_end_index"]
+        end2 = info2["prefix_end_index"]
+        for i in range(end1 + 1):
+            # The actual bytes/content of each prefix message should match
+            m1 = modified1["messages"][i]
+            m2 = modified2["messages"][i]
+            assert m1["role"] == m2["role"]
+            assert m1["content"] == m2["content"]
+
+    def test_prefix_end_index_does_not_exceed_bounds(self, cache):
+        msgs = [_msg("user", f"t{i}") for i in range(MIN_MESSAGES_TO_CACHE + 1)]
+        body = {"messages": msgs}
+        _, info = cache.apply(body)
+        assert info["prefix_end_index"] < len(msgs) - KEEP_TRAILING_MESSAGES

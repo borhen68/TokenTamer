@@ -47,7 +47,7 @@ token-tamer --ssl --port 443 --no-tool-compression    # disable only tool-aware 
 ## ✨ Features
 
 - **🔌 Drop-in proxy** — No changes needed to your coding agent. Just change the API base URL.
-- **🔁 Long-lived session hijacking** — Injects Anthropic `cache_control` breakpoints into outbound requests. Long Claude Code sessions see up to **90% off input tokens** (cached input is `$0.30/Mtoken` vs `$3.00/Mtoken` regular).
+- **🔁 Long-lived session hijacking** — Injects Anthropic `cache_control` breakpoints into outbound requests. Long Claude Code sessions see up to **~73% off input tokens** thanks to cache-first design (cached input is `$0.30/Mtoken` vs `$3.00/Mtoken` regular).
 - **🧠 Smart active file detection** — Automatically identifies which files you're working on and leaves them 100% intact.
 - **🌳 AST-based compression** — Strips function bodies while preserving signatures, imports, and class structures.
 - **🔧 Tool-aware compression** — Skeletonizes stale `tool_result` reads while preserving the latest read of each file. Safe with agents that use function calling.
@@ -216,8 +216,9 @@ This is TokenTamer's most powerful cost-cutting feature. Anthropic offers a **90
 |------------|--------------------|
 | Regular input | $3.00 |
 | **Cached input** | **$0.30** |
+| Cache write (new) | **$3.75** ← one-time, slightly more expensive |
 
-The catch: Claude Code (and most agents) don't use it well. They mutate the conversation prefix every turn, so the cache never hits. TokenTamer fixes this.
+The catch: Claude Code (and most agents) don't use it well. They mutate the conversation prefix every turn, so the cache never hits. TokenTamer fixes this with a **cache-first design**.
 
 ### How it works
 
@@ -240,7 +241,28 @@ TokenTamer injects `cache_control` breakpoints at three stable positions:
 2. **After system prompt** — fixed for the whole session
 3. **After conversation prefix** — everything except the last 2 turns
 
-Result: a 50-turn Claude Code session drops from ~$5.00 to ~$0.50. **Same model. Same reasoning. Same output.** Just smarter billing.
+### Cache-First Design (v0.3.1)
+
+**Why this matters:** Anthropic's cache does **exact prefix matching**. If the bytes of message 2 change between Turn 1 and Turn 2, the entire prefix cache misses — and you pay the **more expensive** cache write cost ($3.75/M) instead of the cheap cache read ($0.30/M).
+
+TokenTamer applies session cache **before** compression:
+1. Cache breakpoints are added to the **original** messages
+2. Tool-aware compression only touches messages **after** the cached prefix
+3. The prefix stays **byte-identical** across turns → cache actually hits
+
+**Tradeoff:** Stale `tool_result` reads inside the cached prefix are preserved intact (not skeletonized). The savings come from the massive prefix being read from cache, not from skeletonizing a few stale reads.
+
+### Real-world savings
+
+A 50-turn Claude Code session (~20k tokens/turn average):
+
+| | Cost |
+|--|------|
+| Without TokenTamer | **~$3.00** |
+| With broken cache (compress-first) | **~$3.15** (worse — pays write cost, never hits) |
+| With TokenTamer (cache-first) | **~$0.80** |
+
+**Net savings: ~73% on long sessions.** Same model. Same reasoning. Same output.
 
 ### Verification
 

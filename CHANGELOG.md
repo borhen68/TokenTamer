@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2024-06-10
+
+### Fixed
+- **Cache-first design** — Session cache is now applied **before** compression on the
+  Anthropic endpoint. Previously, tool-aware compression (which is stateful: a message
+  that is "latest" on turn N becomes "stale" on turn N+1) mutated the conversation prefix
+  every turn. Anthropic's exact-prefix cache then missed on every request, forcing the
+  more expensive cache **write** cost ($3.75/Mtoken) instead of the cheap cache **read**
+  ($0.30/Mtoken). The fix keeps the cached prefix byte-identical across turns.
+  - `session_cache.py`: `_mark_conversation_prefix()` now returns the index of the tagged
+    message (or -1). `apply()` exposes `prefix_end_index` in the info dict.
+  - `server.py`: `anthropic_messages` endpoint applies session cache first, then runs
+    compression on the full conversation, but only replaces messages **after**
+    `prefix_end_index` in the final body.
+  - Honest README pricing: updated claim from "90% off / $5→$0.50" to "~73% off / $3→$0.80"
+    with full explanation of the cache-first tradeoff.
+  - Added 4 new unit tests for prefix index tracking and multi-turn stability.
+  - Added 1 server integration test verifying cache headers are present after the fix.
+
 ## [0.2.0] - 2024-06-09
 
 ### Added

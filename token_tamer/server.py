@@ -8,6 +8,7 @@ payload to the upstream provider. Responses are streamed back transparently.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import time
@@ -323,7 +324,33 @@ def create_app(
                 )
                 all_messages.insert(0, {"role": "system", "content": text_parts})
 
+        # ── Long-lived session hijacking: apply FIRST on original body ──
+        # We must cache BEFORE compression because tool-aware compression is
+        # stateful: a message that is "latest" on turn N becomes "stale" on
+        # turn N+1 and gets skeletonized differently. If we compress first,
+        # the prefix bytes mutate every turn → cache never hits → we pay the
+        # more expensive cache WRITE cost ($3.75/M) instead of cache READ
+        # ($0.30/M).  See README "Cache-First Design" section.
+        cache_info = {"breakpoints": 0, "cached_tokens_estimate": 0, "prefix_end_index": -1}
+        if session_cache_enabled and not passthrough:
+            try:
+                body, cache_info = session_cache.apply(body)
+                if cache_info["breakpoints"] > 0:
+                    logger.info(
+                        f"Session cache: session={cache_info['session_id']} "
+                        f"turn={cache_info['turn_count']} "
+                        f"breakpoints={cache_info['breakpoints']} "
+                        f"cached_tokens≈{cache_info['cached_tokens_estimate']} "
+                        f"prefix_end={cache_info.get('prefix_end_index', -1)}"
+                    )
+            except Exception as e:
+                logger.warning(f"Session cache injection failed: {e}. Forwarding without it.")
+
         # ── Compress (tool-aware) ──
+        # We compress the FULL conversation for correct stale-read detection,
+        # but only apply compression to messages AFTER the cached prefix.
+        # Messages inside the cached prefix stay byte-for-byte identical so
+        # Anthropic's exact-prefix cache actually hits on subsequent turns.
         compressed_messages = messages
         analysis = None
         has_tools = _request_has_tools(body)
@@ -334,13 +361,21 @@ def create_app(
         else:
             try:
                 if has_tools:
-                    compressed_messages, analysis = analyzer.analyze_and_compress_tool_aware(
+                    full_compressed, analysis = analyzer.analyze_and_compress_tool_aware(
                         messages, all_messages=all_messages
                     )
                 else:
-                    compressed_messages, analysis = analyzer.analyze_and_compress(
+                    full_compressed, analysis = analyzer.analyze_and_compress(
                         messages, all_messages=all_messages
                     )
+                # Merge: keep cached prefix intact, compress tail only
+                prefix_end = cache_info.get("prefix_end_index", -1)
+                if prefix_end >= 0 and prefix_end + 1 < len(messages):
+                    cached_prefix = body.get("messages", messages)[: prefix_end + 1]
+                    compressed_tail = full_compressed[prefix_end + 1 :]
+                    compressed_messages = cached_prefix + compressed_tail
+                else:
+                    compressed_messages = full_compressed
                 body["messages"] = compressed_messages
             except Exception as e:
                 logger.warning(f"Compression failed: {e}. Forwarding original payload.")
@@ -380,21 +415,6 @@ def create_app(
         cost_saved = original_cost - compressed_cost
 
         metrics.record_request(req_metrics, cost_saved)
-
-        # ── Long-lived session hijacking via prompt caching ──
-        cache_info = {"breakpoints": 0, "cached_tokens_estimate": 0}
-        if session_cache_enabled and not passthrough:
-            try:
-                body, cache_info = session_cache.apply(body)
-                if cache_info["breakpoints"] > 0:
-                    logger.info(
-                        f"Session cache: session={cache_info['session_id']} "
-                        f"turn={cache_info['turn_count']} "
-                        f"breakpoints={cache_info['breakpoints']} "
-                        f"cached_tokens≈{cache_info['cached_tokens_estimate']}"
-                    )
-            except Exception as e:
-                logger.warning(f"Session cache injection failed: {e}. Forwarding without it.")
 
         # ── Forward to upstream ──
         upstream_url = f"{config.upstream.anthropic_url}/v1/messages"

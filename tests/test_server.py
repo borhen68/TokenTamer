@@ -457,13 +457,15 @@ class TestToolAwareCompression:
         forwarded = mock_post.call_args.kwargs["json"]
         msgs = forwarded["messages"]
 
-        # First tool_result (msg index 2) should be skeletonized
+        # With cache-first design, the conversation prefix (msg 0..3) stays
+        # byte-identical across turns so Anthropic's exact-prefix cache hits.
+        # Msg 2 (stale tool_result) is inside the prefix → preserved intact.
+        # Msg 5 (latest tool_result) is in the tail → also preserved (latest).
         first_result_content = msgs[2]["content"][0]["content"]
-        assert "TokenTamer: stale tool_result" in first_result_content
-        assert "..." in first_result_content
-
-        # Last tool_result (msg index 5) should be UNTOUCHED
         last_result_content = msgs[5]["content"][0]["content"]
+
+        # Both are preserved: msg 2 for cache stability, msg 5 as latest read
+        assert first_result_content == file_body
         assert last_result_content == file_body
 
     @patch("httpx.AsyncClient.post")
@@ -567,10 +569,11 @@ class TestToolAwareCompression:
         response = client.post("/v1/messages", json=payload)
         assert response.status_code == 200
         forwarded = mock_post.call_args.kwargs["json"]
-        # First read's text block should have skeleton marker
+        # With cache-first, msg 1 (stale read) is in the cached prefix →
+        # preserved intact for cross-turn cache stability.
         first = forwarded["messages"][1]["content"][0]["content"][0]["text"]
-        assert "TokenTamer: stale tool_result" in first
-        # Last read's text block is intact
+        assert first == file_body
+        # Last read's text block is intact (latest read)
         last = forwarded["messages"][3]["content"][0]["content"][0]["text"]
         assert last == file_body
 
@@ -726,3 +729,55 @@ class TestSessionCacheIntegration:
                 for blk in content:
                     if isinstance(blk, dict):
                         assert "cache_control" not in blk
+
+    @patch("httpx.AsyncClient.post")
+    def test_cache_first_preserves_prefix_bytes(self, mock_post, client: TestClient):
+        """The v0.3.1 fix: cache is applied BEFORE compression so the cached
+        prefix stays byte-identical across turns. If we compressed first,
+        tool-aware skeletonization would mutate the prefix every turn and
+        Anthropic's exact-prefix cache would never hit."""
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"id": "m"}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "system": "You are a helpful assistant.",
+            "tools": [
+                {
+                    "name": "Read",
+                    "description": "Read a file",
+                    "input_schema": {"type": "object"},
+                }
+            ],
+            "messages": [
+                {"role": "user", "content": "fix app.py"},
+                {"role": "assistant", "content": "Reading app.py..."},
+                {"role": "user", "content": "what does it do?"},
+                {"role": "assistant", "content": "It runs a web server."},
+                {"role": "user", "content": "refund logic"},
+                {"role": "assistant", "content": "def refund(order_id):\\n    pass"},
+                {"role": "user", "content": "test it"},
+            ],
+        }
+
+        response = client.post("/v1/messages", json=payload)
+        assert response.status_code == 200
+        forwarded = mock_post.call_args.kwargs["json"]
+
+        # Cache headers present
+        assert int(response.headers["X-TokenTamer-Cache-Breakpoints"]) >= 1
+
+        # The prefix message (index len-3 = 4) should have cache_control
+        # because session cache ran on the original body before compression.
+        prefix_msg = forwarded["messages"][4]
+        has_cache = False
+        content = prefix_msg.get("content")
+        if isinstance(content, list):
+            for blk in content:
+                if isinstance(blk, dict) and "cache_control" in blk:
+                    has_cache = True
+                    break
+        assert has_cache, "Prefix message should have cache_control from cache-first"
