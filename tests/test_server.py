@@ -145,6 +145,76 @@ class TestAnthropicProxy:
         content = forwarded_body["messages"][0]["content"]
         assert "..." in content  # database.py should be skeletonized
 
+    @patch("httpx.AsyncClient.post")
+    def test_messages_preserves_oauth_authorization(self, mock_post, client: TestClient):
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"id": "msg-test", "content": []}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": False,
+        }
+
+        response = client.post(
+            "/v1/messages?beta=true",
+            json=payload,
+            headers={
+                "Authorization": "Bearer oauth-token",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "oauth-2025-04-20",
+            },
+        )
+
+        assert response.status_code == 200
+        call_args = mock_post.call_args
+        assert call_args.args[0] == "https://fake-anthropic.com/v1/messages?beta=true"
+        forwarded_headers = call_args.kwargs["headers"]
+        assert forwarded_headers["Authorization"] == "Bearer oauth-token"
+        assert forwarded_headers["anthropic-version"] == "2023-06-01"
+        assert forwarded_headers["anthropic-beta"] == "oauth-2025-04-20"
+        assert "x-api-key" not in forwarded_headers
+
+    @patch("httpx.AsyncClient.post")
+    def test_count_tokens_passes_through_anthropic_auth(
+        self, mock_post, client: TestClient
+    ):
+        mock_response = MagicMock()
+        mock_response.content = json.dumps({"input_tokens": 12}).encode()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_post.return_value = mock_response
+
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "Count me"}],
+        }
+
+        response = client.post(
+            "/v1/messages/count_tokens?beta=true",
+            json=payload,
+            headers={
+                "Authorization": "Bearer oauth-token",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "oauth-2025-04-20",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"input_tokens": 12}
+        call_args = mock_post.call_args
+        assert call_args.args[0] == (
+            "https://fake-anthropic.com/v1/messages/count_tokens?beta=true"
+        )
+        assert call_args.kwargs["json"] == payload
+        forwarded_headers = call_args.kwargs["headers"]
+        assert forwarded_headers["Authorization"] == "Bearer oauth-token"
+        assert forwarded_headers["anthropic-beta"] == "oauth-2025-04-20"
+        assert "x-api-key" not in forwarded_headers
+
 
 class TestMetrics:
     def test_metrics_tracked(self, client: TestClient, metrics: SessionMetrics):

@@ -67,6 +67,44 @@ def _request_has_tools(body: dict) -> bool:
     return False
 
 
+def _anthropic_forward_headers(headers: dict, config: Config) -> dict:
+    """Build upstream headers for Anthropic-compatible requests.
+
+    Claude Code can authenticate with either API keys (`x-api-key`) or a
+    Claude.ai OAuth/subscription token (`Authorization: Bearer ...`). Preserve
+    whichever credential the client sent instead of forcing all requests into
+    the API-key header shape.
+    """
+    forward_headers = {
+        "Content-Type": "application/json",
+        "anthropic-version": headers.get("anthropic-version", "2023-06-01"),
+    }
+
+    auth_header = headers.get("authorization", "")
+    api_key = headers.get("x-api-key", "")
+    if auth_header:
+        forward_headers["Authorization"] = auth_header
+    elif api_key:
+        forward_headers["x-api-key"] = api_key
+    else:
+        configured_key = config.get_api_key("anthropic")
+        if configured_key:
+            forward_headers["x-api-key"] = configured_key
+
+    # Forward Claude/Anthropic feature headers such as anthropic-beta.
+    for key, value in headers.items():
+        if key.startswith("anthropic-") and key != "anthropic-version":
+            forward_headers[key] = value
+
+    return forward_headers
+
+
+def _with_query(url: str, request: Request) -> str:
+    """Append the original query string when proxying a route."""
+    query = request.url.query
+    return f"{url}?{query}" if query else url
+
+
 def create_app(
     config: Config,
     metrics: SessionMetrics,
@@ -303,10 +341,6 @@ def create_app(
         body = await request.json()
         headers = dict(request.headers)
 
-        # Anthropic uses x-api-key header
-        api_key = headers.get("x-api-key", "") or config.get_api_key("anthropic")
-        anthropic_version = headers.get("anthropic-version", "2023-06-01")
-
         model = body.get("model", "claude-sonnet-4-20250514")
         messages = body.get("messages", [])
         is_streaming = body.get("stream", False)
@@ -417,17 +451,8 @@ def create_app(
         metrics.record_request(req_metrics, cost_saved)
 
         # ── Forward to upstream ──
-        upstream_url = f"{config.upstream.anthropic_url}/v1/messages"
-        forward_headers = {
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": anthropic_version,
-        }
-
-        # Forward any additional anthropic headers
-        for key, value in headers.items():
-            if key.startswith("anthropic-") and key != "anthropic-version":
-                forward_headers[key] = value
+        upstream_url = _with_query(f"{config.upstream.anthropic_url}/v1/messages", request)
+        forward_headers = _anthropic_forward_headers(headers, config)
 
         cache_headers = {
             "X-TokenTamer-Cache-Breakpoints": str(cache_info["breakpoints"]),
@@ -459,6 +484,32 @@ def create_app(
                     **cache_headers,
                 },
             )
+
+    @app.post("/v1/messages/count_tokens")
+    async def anthropic_count_tokens(request: Request):
+        """Pass through Anthropic token counting requests.
+
+        Claude Code calls this endpoint when using Anthropic Messages format
+        gateways. Token counting must see the original request body, so do not
+        compress or mutate it here.
+        """
+        body = await request.json()
+        headers = dict(request.headers)
+
+        upstream_url = _with_query(
+            f"{config.upstream.anthropic_url}/v1/messages/count_tokens",
+            request,
+        )
+        response = await http_client.post(
+            upstream_url,
+            headers=_anthropic_forward_headers(headers, config),
+            json=body,
+        )
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers={"Content-Type": response.headers.get("content-type", "application/json")},
+        )
 
     # ──────────────────────────────────────────────────────────
     #  OpenAI Responses API (used by Codex CLI)
