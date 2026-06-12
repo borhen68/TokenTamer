@@ -109,26 +109,40 @@ class SessionCache:
             "prefix_end_index": -1,  # messages[0..prefix_end_index] are cached
         }
 
+        existing_breakpoints = self._count_cache_controls(body)
+        if existing_breakpoints > MAX_BREAKPOINTS:
+            self._trim_cache_controls(body, MAX_BREAKPOINTS)
+            existing_breakpoints = MAX_BREAKPOINTS
+
         if len(messages) < MIN_MESSAGES_TO_CACHE:
+            self._normalize_cache_control_ttls(body)
             return body, info
 
         breakpoint_count = 0
 
         # ── 1. Cache the tools array (most stable thing in the request) ──
-        if self._mark_tools_for_caching(body):
+        if (
+            existing_breakpoints + breakpoint_count < MAX_BREAKPOINTS
+            and self._mark_tools_for_caching(body)
+        ):
             breakpoint_count += 1
 
         # ── 2. Cache the system prompt ──
-        if self._mark_system_for_caching(body):
+        if (
+            existing_breakpoints + breakpoint_count < MAX_BREAKPOINTS
+            and self._mark_system_for_caching(body)
+        ):
             breakpoint_count += 1
 
         # ── 3. Cache the conversation prefix (all but trailing turns) ──
-        remaining_budget = MAX_BREAKPOINTS - breakpoint_count
+        remaining_budget = MAX_BREAKPOINTS - existing_breakpoints - breakpoint_count
         if remaining_budget > 0:
             prefix_idx = self._mark_conversation_prefix(body, messages)
             if prefix_idx >= 0:
                 breakpoint_count += 1
                 info["prefix_end_index"] = prefix_idx
+
+        self._normalize_cache_control_ttls(body)
 
         # ── 4. Track the session ──
         session_id = self._fingerprint(messages)
@@ -146,6 +160,77 @@ class SessionCache:
             self.stats.estimated_tokens_cached += info["cached_tokens_estimate"]
 
         return body, info
+
+    @staticmethod
+    def _iter_cache_control_owners(body: dict) -> List[dict]:
+        """Return dict objects that may own Anthropic cache_control markers.
+
+        Anthropic accepts at most four cache breakpoints per request. Claude
+        Code may already send some, so TokenTamer must treat existing markers
+        as consuming the same global budget as markers it injects.
+        """
+        owners: List[dict] = []
+
+        for tool in body.get("tools") or []:
+            if isinstance(tool, dict) and "cache_control" in tool:
+                owners.append(tool)
+
+        system = body.get("system")
+        if isinstance(system, list):
+            for block in system:
+                if isinstance(block, dict) and "cache_control" in block:
+                    owners.append(block)
+
+        for message in body.get("messages") or []:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and "cache_control" in block:
+                        owners.append(block)
+
+        return owners
+
+    @classmethod
+    def _count_cache_controls(cls, body: dict) -> int:
+        return len(cls._iter_cache_control_owners(body))
+
+    @classmethod
+    def _trim_cache_controls(cls, body: dict, limit: int = MAX_BREAKPOINTS) -> int:
+        """Remove surplus cache_control markers from the end of the request."""
+        owners = cls._iter_cache_control_owners(body)
+        removed = 0
+        for owner in reversed(owners[limit:]):
+            owner.pop("cache_control", None)
+            removed += 1
+        return removed
+
+    @classmethod
+    def _normalize_cache_control_ttls(cls, body: dict) -> None:
+        """Keep cache_control TTLs valid in Anthropic processing order.
+
+        Anthropic processes cache breakpoints as tools, system, then messages.
+        A longer-lived 1h block cannot appear after a shorter/default 5m block.
+        If Claude Code already sent any 1h cache block, promote earlier cache
+        blocks to 1h so TokenTamer's injected defaults do not make the request
+        invalid.
+        """
+        owners = cls._iter_cache_control_owners(body)
+        last_one_hour = -1
+        for index, owner in enumerate(owners):
+            cache_control = owner.get("cache_control")
+            if isinstance(cache_control, dict) and cache_control.get("ttl") == "1h":
+                last_one_hour = index
+
+        if last_one_hour < 0:
+            return
+
+        for owner in owners[: last_one_hour + 1]:
+            cache_control = owner.get("cache_control")
+            if not isinstance(cache_control, dict):
+                continue
+            cache_control["ttl"] = "1h"
 
     def reset(self) -> None:
         """Forget all tracked sessions. Useful for tests."""
