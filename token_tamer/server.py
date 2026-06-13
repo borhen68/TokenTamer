@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import gzip
+import io
 import json
 import logging
 import time
@@ -168,7 +169,12 @@ def _decode_body(raw: bytes, encoding: str) -> bytes:
     if enc == "zstd":
         if _zstd is None:
             raise RuntimeError("zstandard package not installed")
-        return _zstd.ZstdDecompressor().decompress(raw)
+        # Codex CLI emits streaming zstd frames without a Content-Size header,
+        # so plain `decompress(raw)` fails with "could not determine content
+        # size". The streaming reader handles both framed and sized inputs.
+        dctx = _zstd.ZstdDecompressor()
+        with dctx.stream_reader(io.BytesIO(raw)) as reader:
+            return reader.read()
     if enc == "br":
         if _brotli is None:
             raise RuntimeError("brotli package not installed")
