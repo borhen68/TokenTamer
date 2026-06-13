@@ -9,15 +9,27 @@ payload to the upstream provider. Responses are streamed back transparently.
 from __future__ import annotations
 
 import copy
+import gzip
 import json
 import logging
 import time
+import zlib
 from typing import AsyncGenerator, List, Optional
 
 import httpx
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+
+try:
+    import zstandard as _zstd
+except ImportError:  # pragma: no cover
+    _zstd = None
+
+try:
+    import brotli as _brotli
+except ImportError:  # pragma: no cover
+    _brotli = None
 
 logger = logging.getLogger("token_tamer")
 
@@ -130,7 +142,52 @@ _HEADERS_TO_STRIP = {
     "te",
     "trailer",
     "accept-encoding",
+    # We decompress incoming bodies and forward as plain bytes, so the
+    # upstream must not be told the body is still compressed.
+    "content-encoding",
 }
+
+
+def _decode_body(raw: bytes, encoding: str) -> bytes:
+    """Decompress a request body according to its Content-Encoding header.
+
+    Codex CLI sends `Content-Encoding: zstd` (and historically gzip), so we
+    must decompress before JSON-parsing. Unknown encodings raise; callers turn
+    that into a 415.
+    """
+    enc = (encoding or "").lower().strip()
+    if not enc or enc == "identity":
+        return raw
+    if enc == "gzip":
+        return gzip.decompress(raw)
+    if enc == "deflate":
+        try:
+            return zlib.decompress(raw)
+        except zlib.error:
+            return zlib.decompress(raw, -zlib.MAX_WBITS)
+    if enc == "zstd":
+        if _zstd is None:
+            raise RuntimeError("zstandard package not installed")
+        return _zstd.ZstdDecompressor().decompress(raw)
+    if enc == "br":
+        if _brotli is None:
+            raise RuntimeError("brotli package not installed")
+        return _brotli.decompress(raw)
+    raise ValueError(f"Unsupported Content-Encoding: {enc!r}")
+
+
+async def _read_json(request: Request) -> dict:
+    """Read and JSON-parse a request body, transparently handling compression."""
+    raw = await request.body()
+    encoding = request.headers.get("content-encoding", "")
+    try:
+        decoded = _decode_body(raw, encoding)
+    except Exception as e:
+        logger.warning(f"Failed to decode {encoding!r} body: {e}")
+        raise HTTPException(status_code=415, detail=f"Cannot decode body: {e}")
+    if not decoded:
+        return {}
+    return json.loads(decoded)
 
 
 def _is_chatgpt_subscription_request(headers: dict) -> bool:
@@ -250,7 +307,7 @@ def create_app(
     @app.post("/v1/chat/completions")
     async def openai_chat_completions(request: Request):
         """Intercept OpenAI Chat Completions, compress, and forward."""
-        body = await request.json()
+        body = await _read_json(request)
         headers = dict(request.headers)
 
         model = body.get("model", "gpt-4o")
@@ -348,7 +405,7 @@ def create_app(
     @app.post("/v1/completions")
     async def openai_completions(request: Request):
         """Pass-through for legacy completions (no compression for non-chat)."""
-        body = await request.json()
+        body = await _read_json(request)
         headers = dict(request.headers)
 
         upstream_url = _with_query(
@@ -395,7 +452,7 @@ def create_app(
     @app.post("/v1/messages")
     async def anthropic_messages(request: Request):
         """Intercept Anthropic Messages API, compress, and forward."""
-        body = await request.json()
+        body = await _read_json(request)
         headers = dict(request.headers)
 
         model = body.get("model", "claude-sonnet-4-20250514")
@@ -550,7 +607,7 @@ def create_app(
         gateways. Token counting must see the original request body, so do not
         compress or mutate it here.
         """
-        body = await request.json()
+        body = await _read_json(request)
         headers = dict(request.headers)
 
         upstream_url = _with_query(
@@ -572,6 +629,17 @@ def create_app(
     #  OpenAI Responses API (used by Codex CLI)
     # ──────────────────────────────────────────────────────────
 
+    @app.get("/v1/responses")
+    async def openai_responses_reject_upgrade(request: Request):
+        """Reject WebSocket upgrade attempts cleanly.
+
+        Codex CLI tries `wss://.../v1/responses` first, falling back to plain
+        HTTPS POST on rejection. Without this handler the GET would fall to the
+        catch-all, which forwards to chatgpt.com — wasting a round-trip and
+        polluting logs with 403s from the upstream's branded error page.
+        """
+        return Response(status_code=426, content="WebSocket not supported")
+
     @app.post("/v1/responses")
     async def openai_responses(request: Request):
         """Intercept OpenAI Responses API (Codex CLI).
@@ -580,7 +648,7 @@ def create_app(
         `messages`. We compress textual code blocks in user messages only,
         leaving tool calls and reasoning items untouched.
         """
-        body = await request.json()
+        body = await _read_json(request)
         headers = dict(request.headers)
 
         model = body.get("model", "gpt-4o")
