@@ -115,6 +115,23 @@ _CHATGPT_PASSTHROUGH_HEADERS = (
     "version",
 )
 
+# Hop-by-hop / connection-scoped headers we must NOT forward. Content-Length is
+# stripped because we re-serialize the body; Accept-Encoding because we want
+# raw bytes (especially for SSE streaming).
+_HEADERS_TO_STRIP = {
+    "host",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "upgrade",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "accept-encoding",
+}
+
 
 def _is_chatgpt_subscription_request(headers: dict) -> bool:
     """Detect a Codex CLI request authenticated via ChatGPT subscription.
@@ -140,26 +157,20 @@ def _openai_upstream_base(headers: dict, config: Config) -> str:
 def _openai_forward_headers(headers: dict, config: Config) -> dict:
     """Build upstream headers for OpenAI-compatible requests.
 
-    Supports two auth modes:
-      * API key: `Authorization: Bearer <OPENAI_API_KEY>` → forwarded as-is.
-      * ChatGPT subscription: `Authorization: Bearer <oauth-token>` plus
-        Codex-specific headers (chatgpt-account-id, originator, ...) which we
-        pass through unchanged so the ChatGPT backend can authorize the call.
+    Forwards all client headers verbatim except hop-by-hop and connection-scoped
+    ones (see `_HEADERS_TO_STRIP`). Preserving `User-Agent`, `OpenAI-Beta`,
+    Codex-specific headers, etc. is required because the ChatGPT backend
+    fingerprints on them and will throttle requests that look unrecognized.
     """
-    forward_headers: dict = {"Content-Type": "application/json"}
+    forward_headers: dict = {
+        k: v for k, v in headers.items() if k.lower() not in _HEADERS_TO_STRIP
+    }
+    forward_headers["Content-Type"] = "application/json"
 
-    auth_header = headers.get("authorization", "")
-    if auth_header:
-        forward_headers["Authorization"] = auth_header
-    else:
+    if not headers.get("authorization"):
         configured_key = config.get_api_key("openai")
         if configured_key:
             forward_headers["Authorization"] = f"Bearer {configured_key}"
-
-    for key, value in headers.items():
-        lowered = key.lower()
-        if lowered.startswith("openai-") or lowered in _CHATGPT_PASSTHROUGH_HEADERS:
-            forward_headers[key] = value
 
     return forward_headers
 
