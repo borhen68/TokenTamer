@@ -238,6 +238,23 @@ def _openai_forward_headers(headers: dict, config: Config) -> dict:
     return forward_headers
 
 
+def _openai_upstream_path(headers: dict, path: str) -> str:
+    """Adapt an incoming OpenAI-style path to the upstream's path scheme.
+
+    The OpenAI public API uses `/v1/...` (e.g., `/v1/responses`). The ChatGPT
+    backend (`chatgpt.com/backend-api/codex`) drops the `/v1` and serves
+    `/responses` directly, so a request proxied as-is hits the wrong URL and
+    chatgpt.com returns 403. Strip the `/v1` prefix when routing to that
+    backend; leave OpenAI-direct traffic untouched.
+    """
+    if _is_chatgpt_subscription_request(headers):
+        if path.startswith("/v1/"):
+            return path[3:]
+        if path.startswith("v1/"):
+            return path[2:]
+    return path
+
+
 def create_app(
     config: Config,
     metrics: SessionMetrics,
@@ -379,7 +396,9 @@ def create_app(
 
         # ── Forward to upstream ──
         upstream_url = _with_query(
-            f"{_openai_upstream_base(headers, config)}/v1/chat/completions", request,
+            f"{_openai_upstream_base(headers, config)}"
+            f"{_openai_upstream_path(headers, '/v1/chat/completions')}",
+            request,
         )
         forward_headers = _openai_forward_headers(headers, config)
 
@@ -415,7 +434,9 @@ def create_app(
         headers = dict(request.headers)
 
         upstream_url = _with_query(
-            f"{_openai_upstream_base(headers, config)}/v1/completions", request,
+            f"{_openai_upstream_base(headers, config)}"
+            f"{_openai_upstream_path(headers, '/v1/completions')}",
+            request,
         )
         forward_headers = _openai_forward_headers(headers, config)
 
@@ -439,7 +460,9 @@ def create_app(
         headers = dict(request.headers)
 
         upstream_url = _with_query(
-            f"{_openai_upstream_base(headers, config)}/v1/models", request,
+            f"{_openai_upstream_base(headers, config)}"
+            f"{_openai_upstream_path(headers, '/v1/models')}",
+            request,
         )
         response = await http_client.get(
             upstream_url,
@@ -719,7 +742,9 @@ def create_app(
         metrics.record_request(req_metrics, original_cost - compressed_cost)
 
         upstream_url = _with_query(
-            f"{_openai_upstream_base(headers, config)}/v1/responses", request,
+            f"{_openai_upstream_base(headers, config)}"
+            f"{_openai_upstream_path(headers, '/v1/responses')}",
+            request,
         )
         forward_headers = _openai_forward_headers(headers, config)
 
@@ -765,7 +790,9 @@ def create_app(
         headers.pop("host", None)
 
         upstream_url = _with_query(
-            f"{_openai_upstream_base(headers, config)}/{path}", request,
+            f"{_openai_upstream_base(headers, config)}"
+            f"{_openai_upstream_path(headers, '/' + path)}",
+            request,
         )
 
         response = await http_client.request(
