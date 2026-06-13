@@ -687,6 +687,7 @@ def create_app(
         # Normalize input → list of pseudo-messages for the analyzer.
         # The Responses API accepts either a string or a list of items.
         synthesized: List[dict] = []
+        has_typed_parts = False
         if isinstance(raw_input, str):
             synthesized = [{"role": "user", "content": raw_input}]
         elif isinstance(raw_input, list):
@@ -699,10 +700,21 @@ def create_app(
                                        "tool_call", "tool_result", "reasoning"):
                         continue
                     content = item.get("content", "")
+                    if not isinstance(content, str):
+                        has_typed_parts = True
                     synthesized.append({"role": role, "content": content})
 
         has_tools = _request_has_tools(body)
-        skip_compression = passthrough or (has_tools and not compress_with_tools)
+        # Codex sends `content` as a list of typed parts (e.g.,
+        # [{"type": "input_text", "text": "..."}]). Our compressor only knows
+        # how to handle plain strings; replacing typed parts with a flat string
+        # breaks the wire shape and chatgpt.com 400s. Skip compression in that
+        # case until we add typed-part-aware rewriting.
+        skip_compression = (
+            passthrough
+            or (has_tools and not compress_with_tools)
+            or has_typed_parts
+        )
 
         compressed_input = raw_input
         analysis = None
