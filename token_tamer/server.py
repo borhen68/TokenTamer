@@ -779,11 +779,6 @@ def create_app(
             response = await http_client.post(
                 upstream_url, headers=forward_headers, json=body,
             )
-            if response.status_code >= 400:
-                logger.warning(
-                    "Upstream /v1/responses %s from %s — body=%r",
-                    response.status_code, upstream_url, response.content[:1000],
-                )
             return Response(
                 content=response.content,
                 status_code=response.status_code,
@@ -852,15 +847,6 @@ async def _stream_proxy(
             json=body,
             timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0),
         ) as response:
-            if response.status_code >= 400:
-                # Read the whole error body so we can log it for diagnosis.
-                error_body = await response.aread()
-                logger.warning(
-                    "Upstream stream %s from %s — body=%r",
-                    response.status_code, url, error_body[:1000],
-                )
-                yield error_body
-                return
             async for chunk in response.aiter_bytes():
                 yield chunk
     except httpx.ReadTimeout:
