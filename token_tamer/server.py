@@ -105,6 +105,65 @@ def _with_query(url: str, request: Request) -> str:
     return f"{url}?{query}" if query else url
 
 
+# Headers Codex CLI sends when authenticated with a ChatGPT subscription.
+# `chatgpt-account-id` is the load-bearing one — its presence is how we detect
+# subscription mode and how the upstream identifies which account to bill.
+_CHATGPT_PASSTHROUGH_HEADERS = (
+    "chatgpt-account-id",
+    "originator",
+    "session_id",
+    "version",
+)
+
+
+def _is_chatgpt_subscription_request(headers: dict) -> bool:
+    """Detect a Codex CLI request authenticated via ChatGPT subscription.
+
+    Codex always sends `chatgpt-account-id` in this mode and never in API-key
+    mode, so we use it as the routing signal.
+    """
+    return bool(headers.get("chatgpt-account-id"))
+
+
+def _openai_upstream_base(headers: dict, config: Config) -> str:
+    """Pick the correct upstream base URL for an OpenAI-format request.
+
+    ChatGPT-subscription Codex traffic must go to the ChatGPT backend, not the
+    standard OpenAI API; everything else (API-key Codex, ChatCompletions
+    clients) uses the configured OpenAI URL.
+    """
+    if _is_chatgpt_subscription_request(headers):
+        return config.upstream.chatgpt_backend_url
+    return config.upstream.openai_url
+
+
+def _openai_forward_headers(headers: dict, config: Config) -> dict:
+    """Build upstream headers for OpenAI-compatible requests.
+
+    Supports two auth modes:
+      * API key: `Authorization: Bearer <OPENAI_API_KEY>` → forwarded as-is.
+      * ChatGPT subscription: `Authorization: Bearer <oauth-token>` plus
+        Codex-specific headers (chatgpt-account-id, originator, ...) which we
+        pass through unchanged so the ChatGPT backend can authorize the call.
+    """
+    forward_headers: dict = {"Content-Type": "application/json"}
+
+    auth_header = headers.get("authorization", "")
+    if auth_header:
+        forward_headers["Authorization"] = auth_header
+    else:
+        configured_key = config.get_api_key("openai")
+        if configured_key:
+            forward_headers["Authorization"] = f"Bearer {configured_key}"
+
+    for key, value in headers.items():
+        lowered = key.lower()
+        if lowered.startswith("openai-") or lowered in _CHATGPT_PASSTHROUGH_HEADERS:
+            forward_headers[key] = value
+
+    return forward_headers
+
+
 def create_app(
     config: Config,
     metrics: SessionMetrics,
@@ -183,14 +242,6 @@ def create_app(
         body = await request.json()
         headers = dict(request.headers)
 
-        # Resolve API key
-        auth_header = headers.get("authorization", "")
-        api_key = ""
-        if auth_header.startswith("Bearer "):
-            api_key = auth_header[7:]
-        if not api_key:
-            api_key = config.get_api_key("openai")
-
         model = body.get("model", "gpt-4o")
         messages = body.get("messages", [])
         is_streaming = body.get("stream", False)
@@ -253,11 +304,10 @@ def create_app(
         metrics.record_request(req_metrics, cost_saved)
 
         # ── Forward to upstream ──
-        upstream_url = f"{config.upstream.openai_url}/v1/chat/completions"
-        forward_headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        }
+        upstream_url = _with_query(
+            f"{_openai_upstream_base(headers, config)}/v1/chat/completions", request,
+        )
+        forward_headers = _openai_forward_headers(headers, config)
 
         if is_streaming:
             return StreamingResponse(
@@ -290,14 +340,10 @@ def create_app(
         body = await request.json()
         headers = dict(request.headers)
 
-        auth_header = headers.get("authorization", "")
-        api_key = auth_header[7:] if auth_header.startswith("Bearer ") else config.get_api_key("openai")
-
-        upstream_url = f"{config.upstream.openai_url}/v1/completions"
-        forward_headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        }
+        upstream_url = _with_query(
+            f"{_openai_upstream_base(headers, config)}/v1/completions", request,
+        )
+        forward_headers = _openai_forward_headers(headers, config)
 
         is_streaming = body.get("stream", False)
         if is_streaming:
@@ -317,13 +363,13 @@ def create_app(
     async def openai_models(request: Request):
         """Pass-through for model listing."""
         headers = dict(request.headers)
-        auth_header = headers.get("authorization", "")
-        api_key = auth_header[7:] if auth_header.startswith("Bearer ") else config.get_api_key("openai")
 
-        upstream_url = f"{config.upstream.openai_url}/v1/models"
+        upstream_url = _with_query(
+            f"{_openai_upstream_base(headers, config)}/v1/models", request,
+        )
         response = await http_client.get(
             upstream_url,
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=_openai_forward_headers(headers, config),
         )
         return Response(
             content=response.content,
@@ -526,9 +572,6 @@ def create_app(
         body = await request.json()
         headers = dict(request.headers)
 
-        auth_header = headers.get("authorization", "")
-        api_key = auth_header[7:] if auth_header.startswith("Bearer ") else config.get_api_key("openai")
-
         model = body.get("model", "gpt-4o")
         is_streaming = body.get("stream", False)
         raw_input = body.get("input", "")
@@ -590,15 +633,10 @@ def create_app(
         compressed_cost = counter.estimate_cost(compressed_tokens, 0, pricing.input, pricing.output)
         metrics.record_request(req_metrics, original_cost - compressed_cost)
 
-        upstream_url = f"{config.upstream.openai_url}/v1/responses"
-        forward_headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        }
-        # Forward OpenAI-Beta and other custom headers
-        for k, v in headers.items():
-            if k.lower().startswith("openai-"):
-                forward_headers[k] = v
+        upstream_url = _with_query(
+            f"{_openai_upstream_base(headers, config)}/v1/responses", request,
+        )
+        forward_headers = _openai_forward_headers(headers, config)
 
         if is_streaming:
             return StreamingResponse(
@@ -629,14 +667,21 @@ def create_app(
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
     async def catch_all(request: Request, path: str):
-        """Pass through any unrecognized routes to the OpenAI upstream."""
+        """Pass through unrecognized routes to the right OpenAI-side upstream.
+
+        Codex CLI on a ChatGPT subscription occasionally hits auxiliary routes
+        (e.g. account info) on the ChatGPT backend; route those there based on
+        the same `chatgpt-account-id` signal we use for /v1/responses.
+        """
         body = await request.body()
         headers = dict(request.headers)
 
         # Remove host header to avoid conflicts
         headers.pop("host", None)
 
-        upstream_url = f"{config.upstream.openai_url}/{path}"
+        upstream_url = _with_query(
+            f"{_openai_upstream_base(headers, config)}/{path}", request,
+        )
 
         response = await http_client.request(
             method=request.method,
