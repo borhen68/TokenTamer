@@ -146,6 +146,11 @@ _HEADERS_TO_STRIP = {
     # We decompress incoming bodies and forward as plain bytes, so the
     # upstream must not be told the body is still compressed.
     "content-encoding",
+    # Strip incoming Content-Type so we can set a canonical one without
+    # ending up with a duplicate header (httpx joins case-different keys
+    # like "content-type" and "Content-Type" into a single comma-separated
+    # value, which strict backends reject as "Unsupported content type").
+    "content-type",
 }
 
 
