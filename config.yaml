@@ -9,6 +9,9 @@ proxy:
 upstream:
   openai_url: "https://api.openai.com"
   anthropic_url: "https://api.anthropic.com"
+  # Used by Codex CLI when signed in with a ChatGPT subscription
+  # (Plus/Pro/Team) instead of an OpenAI API key.
+  chatgpt_backend_url: "https://chatgpt.com/backend-api/codex"
 
 # API keys: can also be set via environment variables
 # OPENAI_API_KEY and ANTHROPIC_API_KEY

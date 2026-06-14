@@ -239,6 +239,84 @@ class TestLimitsAndIdempotency:
         markers = _count_cache_markers(body)
         assert markers == info1["breakpoints"]
 
+    def test_existing_breakpoints_consume_budget(self, cache):
+        msgs = [
+            _msg("user", [{"type": "text", "text": f"turn {i}"}])
+            for i in range(8)
+        ]
+        for msg in msgs[:3]:
+            msg["content"][0]["cache_control"] = {"type": "ephemeral"}
+        body = {
+            "system": "System prompt",
+            "messages": msgs,
+            "tools": [{"name": "Read"}],
+        }
+
+        modified, info = cache.apply(body)
+
+        assert _count_cache_markers(modified) <= MAX_BREAKPOINTS
+        assert info["breakpoints"] <= 1
+
+    def test_surplus_existing_breakpoints_are_trimmed(self, cache):
+        msgs = [
+            _msg("user", [{"type": "text", "text": f"turn {i}"}])
+            for i in range(5)
+        ]
+        body = {
+            "system": [
+                {"type": "text", "text": "system", "cache_control": {"type": "ephemeral"}},
+            ],
+            "messages": msgs,
+            "tools": [
+                {"name": "Read", "cache_control": {"type": "ephemeral"}},
+            ],
+        }
+        for msg in msgs[:3]:
+            msg["content"][0]["cache_control"] = {"type": "ephemeral"}
+
+        modified, info = cache.apply(body)
+
+        assert _count_cache_markers(modified) == MAX_BREAKPOINTS
+        assert info["breakpoints"] == 0
+
+    def test_injected_breakpoint_before_one_hour_ttl_is_promoted(self, cache):
+        body = {
+            "system": [
+                {"type": "text", "text": "first"},
+                {
+                    "type": "text",
+                    "text": "second",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                },
+            ],
+            "messages": [_msg("user", f"turn {i}") for i in range(5)],
+            "tools": [{"name": "Read"}],
+        }
+
+        modified, info = cache.apply(body)
+
+        assert modified["tools"][0]["cache_control"]["ttl"] == "1h"
+        assert modified["system"][1]["cache_control"]["ttl"] == "1h"
+        assert _cache_ttls_are_valid(modified)
+
+    def test_existing_short_request_ttls_are_normalized(self, cache):
+        body = {
+            "system": [
+                {"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}},
+                {
+                    "type": "text",
+                    "text": "b",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                },
+            ],
+            "messages": [_msg("user", "short"), _msg("assistant", "ok")],
+        }
+
+        modified, info = cache.apply(body)
+
+        assert modified["system"][0]["cache_control"]["ttl"] == "1h"
+        assert _cache_ttls_are_valid(modified)
+
 
 def _count_cache_markers(body: dict) -> int:
     count = 0
@@ -257,6 +335,20 @@ def _count_cache_markers(body: dict) -> int:
                 if isinstance(blk, dict) and "cache_control" in blk:
                     count += 1
     return count
+
+
+def _cache_ttls_are_valid(body: dict) -> bool:
+    seen_short = False
+    owners = SessionCache._iter_cache_control_owners(body)
+    for owner in owners:
+        cache_control = owner.get("cache_control")
+        ttl = cache_control.get("ttl") if isinstance(cache_control, dict) else None
+        is_one_hour = ttl == "1h"
+        if seen_short and is_one_hour:
+            return False
+        if not is_one_hour:
+            seen_short = True
+    return True
 
 
 # ──────────────────────────────────────────────────────────
