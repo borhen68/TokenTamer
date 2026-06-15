@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
             "Disable long-lived session hijacking via prompt caching. "
             "Enabled by default — injects cache_control breakpoints into "
             "Anthropic requests so the conversation prefix is reused, "
-            "delivering up to a 90% discount on input tokens for long sessions."
+            "delivering up to ~73%% off input tokens for long sessions."
         ),
     )
     parser.add_argument(
