@@ -9,15 +9,28 @@ payload to the upstream provider. Responses are streamed back transparently.
 from __future__ import annotations
 
 import copy
+import gzip
+import io
 import json
 import logging
 import time
+import zlib
 from typing import AsyncGenerator, List, Optional
 
 import httpx
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+
+try:
+    import zstandard as _zstd
+except ImportError:  # pragma: no cover
+    _zstd = None
+
+try:
+    import brotli as _brotli
+except ImportError:  # pragma: no cover
+    _brotli = None
 
 logger = logging.getLogger("token_tamer")
 
@@ -65,6 +78,186 @@ def _request_has_tools(body: dict) -> bool:
                     ):
                         return True
     return False
+
+
+def _anthropic_forward_headers(headers: dict, config: Config) -> dict:
+    """Build upstream headers for Anthropic-compatible requests.
+
+    Claude Code can authenticate with either API keys (`x-api-key`) or a
+    Claude.ai OAuth/subscription token (`Authorization: Bearer ...`). Preserve
+    whichever credential the client sent instead of forcing all requests into
+    the API-key header shape.
+    """
+    forward_headers = {
+        "Content-Type": "application/json",
+        "anthropic-version": headers.get("anthropic-version", "2023-06-01"),
+    }
+
+    auth_header = headers.get("authorization", "")
+    api_key = headers.get("x-api-key", "")
+    if auth_header:
+        forward_headers["Authorization"] = auth_header
+    elif api_key:
+        forward_headers["x-api-key"] = api_key
+    else:
+        configured_key = config.get_api_key("anthropic")
+        if configured_key:
+            forward_headers["x-api-key"] = configured_key
+
+    # Forward Claude/Anthropic feature headers such as anthropic-beta.
+    for key, value in headers.items():
+        if key.startswith("anthropic-") and key != "anthropic-version":
+            forward_headers[key] = value
+
+    return forward_headers
+
+
+def _with_query(url: str, request: Request) -> str:
+    """Append the original query string when proxying a route."""
+    query = request.url.query
+    return f"{url}?{query}" if query else url
+
+
+# Headers Codex CLI sends when authenticated with a ChatGPT subscription.
+# `chatgpt-account-id` is the load-bearing one — its presence is how we detect
+# subscription mode and how the upstream identifies which account to bill.
+_CHATGPT_PASSTHROUGH_HEADERS = (
+    "chatgpt-account-id",
+    "originator",
+    "session_id",
+    "version",
+)
+
+# Hop-by-hop / connection-scoped headers we must NOT forward. Content-Length is
+# stripped because we re-serialize the body; Accept-Encoding because we want
+# raw bytes (especially for SSE streaming).
+_HEADERS_TO_STRIP = {
+    "host",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "upgrade",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "accept-encoding",
+    # We decompress incoming bodies and forward as plain bytes, so the
+    # upstream must not be told the body is still compressed.
+    "content-encoding",
+    # Strip incoming Content-Type so we can set a canonical one without
+    # ending up with a duplicate header (httpx joins case-different keys
+    # like "content-type" and "Content-Type" into a single comma-separated
+    # value, which strict backends reject as "Unsupported content type").
+    "content-type",
+}
+
+
+def _decode_body(raw: bytes, encoding: str) -> bytes:
+    """Decompress a request body according to its Content-Encoding header.
+
+    Codex CLI sends `Content-Encoding: zstd` (and historically gzip), so we
+    must decompress before JSON-parsing. Unknown encodings raise; callers turn
+    that into a 415.
+    """
+    enc = (encoding or "").lower().strip()
+    if not enc or enc == "identity":
+        return raw
+    if enc == "gzip":
+        return gzip.decompress(raw)
+    if enc == "deflate":
+        try:
+            return zlib.decompress(raw)
+        except zlib.error:
+            return zlib.decompress(raw, -zlib.MAX_WBITS)
+    if enc == "zstd":
+        if _zstd is None:
+            raise RuntimeError("zstandard package not installed")
+        # Codex CLI emits streaming zstd frames without a Content-Size header,
+        # so plain `decompress(raw)` fails with "could not determine content
+        # size". The streaming reader handles both framed and sized inputs.
+        dctx = _zstd.ZstdDecompressor()
+        with dctx.stream_reader(io.BytesIO(raw)) as reader:
+            return reader.read()
+    if enc == "br":
+        if _brotli is None:
+            raise RuntimeError("brotli package not installed")
+        return _brotli.decompress(raw)
+    raise ValueError(f"Unsupported Content-Encoding: {enc!r}")
+
+
+async def _read_json(request: Request) -> dict:
+    """Read and JSON-parse a request body, transparently handling compression."""
+    raw = await request.body()
+    encoding = request.headers.get("content-encoding", "")
+    try:
+        decoded = _decode_body(raw, encoding)
+    except Exception as e:
+        logger.warning(f"Failed to decode {encoding!r} body: {e}")
+        raise HTTPException(status_code=415, detail=f"Cannot decode body: {e}")
+    if not decoded:
+        return {}
+    return json.loads(decoded)
+
+
+def _is_chatgpt_subscription_request(headers: dict) -> bool:
+    """Detect a Codex CLI request authenticated via ChatGPT subscription.
+
+    Codex always sends `chatgpt-account-id` in this mode and never in API-key
+    mode, so we use it as the routing signal.
+    """
+    return bool(headers.get("chatgpt-account-id"))
+
+
+def _openai_upstream_base(headers: dict, config: Config) -> str:
+    """Pick the correct upstream base URL for an OpenAI-format request.
+
+    ChatGPT-subscription Codex traffic must go to the ChatGPT backend, not the
+    standard OpenAI API; everything else (API-key Codex, ChatCompletions
+    clients) uses the configured OpenAI URL.
+    """
+    if _is_chatgpt_subscription_request(headers):
+        return config.upstream.chatgpt_backend_url
+    return config.upstream.openai_url
+
+
+def _openai_forward_headers(headers: dict, config: Config) -> dict:
+    """Build upstream headers for OpenAI-compatible requests.
+
+    Forwards all client headers verbatim except hop-by-hop and connection-scoped
+    ones (see `_HEADERS_TO_STRIP`). Preserving `User-Agent`, `OpenAI-Beta`,
+    Codex-specific headers, etc. is required because the ChatGPT backend
+    fingerprints on them and will throttle requests that look unrecognized.
+    """
+    forward_headers: dict = {
+        k: v for k, v in headers.items() if k.lower() not in _HEADERS_TO_STRIP
+    }
+    forward_headers["Content-Type"] = "application/json"
+
+    if not headers.get("authorization"):
+        configured_key = config.get_api_key("openai")
+        if configured_key:
+            forward_headers["Authorization"] = f"Bearer {configured_key}"
+
+    return forward_headers
+
+
+def _openai_upstream_path(headers: dict, path: str) -> str:
+    """Adapt an incoming OpenAI-style path to the upstream's path scheme.
+
+    The OpenAI public API uses `/v1/...` (e.g., `/v1/responses`). The ChatGPT
+    backend (`chatgpt.com/backend-api/codex`) drops the `/v1` and serves
+    `/responses` directly, so a request proxied as-is hits the wrong URL and
+    chatgpt.com returns 403. Strip the `/v1` prefix when routing to that
+    backend; leave OpenAI-direct traffic untouched.
+    """
+    if _is_chatgpt_subscription_request(headers):
+        if path.startswith("/v1/"):
+            return path[3:]
+        if path.startswith("v1/"):
+            return path[2:]
+    return path
 
 
 def create_app(
@@ -142,16 +335,8 @@ def create_app(
     @app.post("/v1/chat/completions")
     async def openai_chat_completions(request: Request):
         """Intercept OpenAI Chat Completions, compress, and forward."""
-        body = await request.json()
+        body = await _read_json(request)
         headers = dict(request.headers)
-
-        # Resolve API key
-        auth_header = headers.get("authorization", "")
-        api_key = ""
-        if auth_header.startswith("Bearer "):
-            api_key = auth_header[7:]
-        if not api_key:
-            api_key = config.get_api_key("openai")
 
         model = body.get("model", "gpt-4o")
         messages = body.get("messages", [])
@@ -215,11 +400,12 @@ def create_app(
         metrics.record_request(req_metrics, cost_saved)
 
         # ── Forward to upstream ──
-        upstream_url = f"{config.upstream.openai_url}/v1/chat/completions"
-        forward_headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        }
+        upstream_url = _with_query(
+            f"{_openai_upstream_base(headers, config)}"
+            f"{_openai_upstream_path(headers, '/v1/chat/completions')}",
+            request,
+        )
+        forward_headers = _openai_forward_headers(headers, config)
 
         if is_streaming:
             return StreamingResponse(
@@ -249,17 +435,15 @@ def create_app(
     @app.post("/v1/completions")
     async def openai_completions(request: Request):
         """Pass-through for legacy completions (no compression for non-chat)."""
-        body = await request.json()
+        body = await _read_json(request)
         headers = dict(request.headers)
 
-        auth_header = headers.get("authorization", "")
-        api_key = auth_header[7:] if auth_header.startswith("Bearer ") else config.get_api_key("openai")
-
-        upstream_url = f"{config.upstream.openai_url}/v1/completions"
-        forward_headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        }
+        upstream_url = _with_query(
+            f"{_openai_upstream_base(headers, config)}"
+            f"{_openai_upstream_path(headers, '/v1/completions')}",
+            request,
+        )
+        forward_headers = _openai_forward_headers(headers, config)
 
         is_streaming = body.get("stream", False)
         if is_streaming:
@@ -279,13 +463,15 @@ def create_app(
     async def openai_models(request: Request):
         """Pass-through for model listing."""
         headers = dict(request.headers)
-        auth_header = headers.get("authorization", "")
-        api_key = auth_header[7:] if auth_header.startswith("Bearer ") else config.get_api_key("openai")
 
-        upstream_url = f"{config.upstream.openai_url}/v1/models"
+        upstream_url = _with_query(
+            f"{_openai_upstream_base(headers, config)}"
+            f"{_openai_upstream_path(headers, '/v1/models')}",
+            request,
+        )
         response = await http_client.get(
             upstream_url,
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=_openai_forward_headers(headers, config),
         )
         return Response(
             content=response.content,
@@ -300,12 +486,8 @@ def create_app(
     @app.post("/v1/messages")
     async def anthropic_messages(request: Request):
         """Intercept Anthropic Messages API, compress, and forward."""
-        body = await request.json()
+        body = await _read_json(request)
         headers = dict(request.headers)
-
-        # Anthropic uses x-api-key header
-        api_key = headers.get("x-api-key", "") or config.get_api_key("anthropic")
-        anthropic_version = headers.get("anthropic-version", "2023-06-01")
 
         model = body.get("model", "claude-sonnet-4-20250514")
         messages = body.get("messages", [])
@@ -417,17 +599,8 @@ def create_app(
         metrics.record_request(req_metrics, cost_saved)
 
         # ── Forward to upstream ──
-        upstream_url = f"{config.upstream.anthropic_url}/v1/messages"
-        forward_headers = {
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": anthropic_version,
-        }
-
-        # Forward any additional anthropic headers
-        for key, value in headers.items():
-            if key.startswith("anthropic-") and key != "anthropic-version":
-                forward_headers[key] = value
+        upstream_url = _with_query(f"{config.upstream.anthropic_url}/v1/messages", request)
+        forward_headers = _anthropic_forward_headers(headers, config)
 
         cache_headers = {
             "X-TokenTamer-Cache-Breakpoints": str(cache_info["breakpoints"]),
@@ -460,9 +633,46 @@ def create_app(
                 },
             )
 
+    @app.post("/v1/messages/count_tokens")
+    async def anthropic_count_tokens(request: Request):
+        """Pass through Anthropic token counting requests.
+
+        Claude Code calls this endpoint when using Anthropic Messages format
+        gateways. Token counting must see the original request body, so do not
+        compress or mutate it here.
+        """
+        body = await _read_json(request)
+        headers = dict(request.headers)
+
+        upstream_url = _with_query(
+            f"{config.upstream.anthropic_url}/v1/messages/count_tokens",
+            request,
+        )
+        response = await http_client.post(
+            upstream_url,
+            headers=_anthropic_forward_headers(headers, config),
+            json=body,
+        )
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers={"Content-Type": response.headers.get("content-type", "application/json")},
+        )
+
     # ──────────────────────────────────────────────────────────
     #  OpenAI Responses API (used by Codex CLI)
     # ──────────────────────────────────────────────────────────
+
+    @app.get("/v1/responses")
+    async def openai_responses_reject_upgrade(request: Request):
+        """Reject WebSocket upgrade attempts cleanly.
+
+        Codex CLI tries `wss://.../v1/responses` first, falling back to plain
+        HTTPS POST on rejection. Without this handler the GET would fall to the
+        catch-all, which forwards to chatgpt.com — wasting a round-trip and
+        polluting logs with 403s from the upstream's branded error page.
+        """
+        return Response(status_code=426, content="WebSocket not supported")
 
     @app.post("/v1/responses")
     async def openai_responses(request: Request):
@@ -472,11 +682,8 @@ def create_app(
         `messages`. We compress textual code blocks in user messages only,
         leaving tool calls and reasoning items untouched.
         """
-        body = await request.json()
+        body = await _read_json(request)
         headers = dict(request.headers)
-
-        auth_header = headers.get("authorization", "")
-        api_key = auth_header[7:] if auth_header.startswith("Bearer ") else config.get_api_key("openai")
 
         model = body.get("model", "gpt-4o")
         is_streaming = body.get("stream", False)
@@ -485,6 +692,7 @@ def create_app(
         # Normalize input → list of pseudo-messages for the analyzer.
         # The Responses API accepts either a string or a list of items.
         synthesized: List[dict] = []
+        has_typed_parts = False
         if isinstance(raw_input, str):
             synthesized = [{"role": "user", "content": raw_input}]
         elif isinstance(raw_input, list):
@@ -497,10 +705,21 @@ def create_app(
                                        "tool_call", "tool_result", "reasoning"):
                         continue
                     content = item.get("content", "")
+                    if not isinstance(content, str):
+                        has_typed_parts = True
                     synthesized.append({"role": role, "content": content})
 
         has_tools = _request_has_tools(body)
-        skip_compression = passthrough or (has_tools and not compress_with_tools)
+        # Codex sends `content` as a list of typed parts (e.g.,
+        # [{"type": "input_text", "text": "..."}]). Our compressor only knows
+        # how to handle plain strings; replacing typed parts with a flat string
+        # breaks the wire shape and chatgpt.com 400s. Skip compression in that
+        # case until we add typed-part-aware rewriting.
+        skip_compression = (
+            passthrough
+            or (has_tools and not compress_with_tools)
+            or has_typed_parts
+        )
 
         compressed_input = raw_input
         analysis = None
@@ -539,15 +758,12 @@ def create_app(
         compressed_cost = counter.estimate_cost(compressed_tokens, 0, pricing.input, pricing.output)
         metrics.record_request(req_metrics, original_cost - compressed_cost)
 
-        upstream_url = f"{config.upstream.openai_url}/v1/responses"
-        forward_headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        }
-        # Forward OpenAI-Beta and other custom headers
-        for k, v in headers.items():
-            if k.lower().startswith("openai-"):
-                forward_headers[k] = v
+        upstream_url = _with_query(
+            f"{_openai_upstream_base(headers, config)}"
+            f"{_openai_upstream_path(headers, '/v1/responses')}",
+            request,
+        )
+        forward_headers = _openai_forward_headers(headers, config)
 
         if is_streaming:
             return StreamingResponse(
@@ -578,14 +794,23 @@ def create_app(
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
     async def catch_all(request: Request, path: str):
-        """Pass through any unrecognized routes to the OpenAI upstream."""
+        """Pass through unrecognized routes to the right OpenAI-side upstream.
+
+        Codex CLI on a ChatGPT subscription occasionally hits auxiliary routes
+        (e.g. account info) on the ChatGPT backend; route those there based on
+        the same `chatgpt-account-id` signal we use for /v1/responses.
+        """
         body = await request.body()
         headers = dict(request.headers)
 
         # Remove host header to avoid conflicts
         headers.pop("host", None)
 
-        upstream_url = f"{config.upstream.openai_url}/{path}"
+        upstream_url = _with_query(
+            f"{_openai_upstream_base(headers, config)}"
+            f"{_openai_upstream_path(headers, '/' + path)}",
+            request,
+        )
 
         response = await http_client.request(
             method=request.method,

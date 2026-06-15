@@ -25,6 +25,9 @@ class ProxyConfig:
 class UpstreamConfig:
     openai_url: str = "https://api.openai.com"
     anthropic_url: str = "https://api.anthropic.com"
+    # ChatGPT-subscription backend used by Codex CLI when the user is signed in
+    # with a ChatGPT Plus/Pro/Team account instead of an OpenAI API key.
+    chatgpt_backend_url: str = "https://chatgpt.com/backend-api/codex"
 
 
 @dataclass
@@ -126,6 +129,9 @@ def load_config(config_path: Union[str, Path, None] = None) -> Config:
         config.upstream = UpstreamConfig(
             openai_url=raw["upstream"].get("openai_url", config.upstream.openai_url),
             anthropic_url=raw["upstream"].get("anthropic_url", config.upstream.anthropic_url),
+            chatgpt_backend_url=raw["upstream"].get(
+                "chatgpt_backend_url", config.upstream.chatgpt_backend_url
+            ),
         )
 
     # API keys (env vars take priority)
